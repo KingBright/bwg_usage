@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+
+	"github.com/joho/godotenv"
 )
 
 func bwgHandler(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +49,9 @@ func staticHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// 显式加载.env文件
+	_ = godotenv.Load(".env")
+
 	http.HandleFunc("/api/bwg", bwgHandler)
 	http.HandleFunc("/", staticHandler)
 
