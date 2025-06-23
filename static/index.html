@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>搬瓦工VPS流量监控</title>
+    <style>
+        :root {
+            --primary: #4361ee;
+            --warning: #f9c74f;
+            --danger: #f94144;
+            --success: #90be6d;
+            --dark: #2b2d42;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        body {
+            background-color: #f8f9fa;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%);
+            color: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+        h1 {
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+        }
+        .card-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 6px 15px rgba(0,0,0,0.08);
+            transition: transform 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        .card h2 {
+            color: var(--dark);
+            margin-bottom: 20px;
+            font-size: 1.4rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .card h2 i {
+            font-size: 1.6rem;
+            color: var(--primary);
+        }
+        .stats {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .stat-label {
+            font-weight: 600;
+            color: #555;
+        }
+        .stat-value {
+            font-weight: 700;
+            font-size: 1.2rem;
+            color: var(--dark);
+        }
+        .progress-container {
+            margin: 25px 0;
+        }
+        .progress-bar {
+            height: 25px;
+            background-color: #e9ecef;
+            border-radius: 50px;
+            overflow: hidden;
+            position: relative;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--success));
+            border-radius: 50px;
+            transition: width 0.8s ease;
+        }
+        .progress-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-weight: 700;
+            color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
+        .reset-card {
+            background: linear-gradient(135deg, #ff9a9e 0%, #fad0c4 100%);
+            color: #333;
+            text-align: center;
+            grid-column: 1 / -1;
+        }
+        .countdown {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin: 15px 0;
+            color: #d90429;
+        }
+        .api-info {
+            background-color: #e7ecef;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 20px;
+            font-family: monospace;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 0.9rem;
+        }
+        .refresh-btn {
+            display: block;
+            margin: 30px auto;
+            padding: 14px 35px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(67, 97, 238, 0.3);
+        }
+        .refresh-btn:hover {
+            background: #3a0ca3;
+            transform: translateY(-3px);
+            box-shadow: 0 7px 20px rgba(67, 97, 238, 0.4);
+        }
+        footer {
+            text-align: center;
+            margin-top: 40px;
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+        @media (max-width: 768px) {
+            .card-container {
+                grid-template-columns: 1fr;
+            }
+            h1 {
+                font-size: 1.8rem;
+            }
+        }
+    </style>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><i class="fas fa-server"></i> 搬瓦工VPS流量监控</h1>
+            <p>实时监控您的VPS流量使用情况</p>
+        </header>
+        
+        <div class="card-container">
+            <div class="card">
+                <h2><i class="fas fa-tachometer-alt"></i> 流量使用概览</h2>
+                <div class="stats">
+                    <div class="stat-item">
+                        <span class="stat-label">总流量：</span>
+                        <span class="stat-value" id="total-data">-- GB</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">已用流量：</span>
+                        <span class="stat-value" id="used-data">-- GB</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">剩余流量：</span>
+                        <span class="stat-value" id="remaining-data">-- GB</span>
+                    </div>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="usage-progress" style="width: 0%"></div>
+                        <div class="progress-text" id="usage-percentage">0%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2><i class="fas fa-info-circle"></i> VPS基本信息</h2>
+                <div class="stats">
+                    <div class="stat-item">
+                        <span class="stat-label">主机名：</span>
+                        <span class="stat-value" id="hostname">--</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">IP地址：</span>
+                        <span class="stat-value" id="ip-address">--</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">节点位置：</span>
+                        <span class="stat-value" id="location">--</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">操作系统：</span>
+                        <span class="stat-value" id="os">--</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card reset-card">
+                <h2><i class="fas fa-sync-alt"></i> 流量重置倒计时</h2>
+                <p>下次流量重置时间：<strong id="reset-date">--</strong></p>
+                <div class="countdown" id="countdown">--天 --:--:--</div>
+                <p>流量将自动重置，无需手动操作</p>
+            </div>
+        </div>
+        
+        <div class="api-info">
+            <p>API 状态: <span id="api-status">等待请求...</span></p>
+        </div>
+        
+        <button class="refresh-btn" id="refresh-btn">
+            <i class="fas fa-sync-alt"></i> 刷新数据
+        </button>
+        
+        <footer>
+            <p>数据更新时间: <span id="update-time">--</span></p>
+            <p>© 2025 搬瓦工VPS流量监控面板 | 数据来源于64clouds API</p>
+        </footer>
+    </div>
+
+    <script>
+        // 配置信息
+        const apiUrl = 'api/bwg';
+        
+        // DOM元素
+        const elements = {
+            totalData: document.getElementById('total-data'),
+            usedData: document.getElementById('used-data'),
+            remainingData: document.getElementById('remaining-data'),
+            usageProgress: document.getElementById('usage-progress'),
+            usagePercentage: document.getElementById('usage-percentage'),
+            resetDate: document.getElementById('reset-date'),
+            countdown: document.getElementById('countdown'),
+            hostname: document.getElementById('hostname'),
+            ipAddress: document.getElementById('ip-address'),
+            location: document.getElementById('location'),
+            os: document.getElementById('os'),
+            apiStatus: document.getElementById('api-status'),
+            updateTime: document.getElementById('update-time'),
+            refreshBtn: document.getElementById('refresh-btn')
+        };
+        
+        // 字节转GB
+        function bytesToGB(bytes) {
+            return (bytes / 1073741824).toFixed(2);
+        }
+        
+        // 时间戳转日期
+        function timestampToDate(timestamp) {
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+        
+        // 计算倒计时
+        function calculateCountdown(timestamp) {
+            const now = new Date();
+            const resetDate = new Date(timestamp * 1000);
+            const diff = resetDate - now;
+            
+            if (diff <= 0) return "已重置";
+            
+            const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+            const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+            const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+            const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+            
+            return `${days}天 ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+        
+        // 获取并处理数据
+        async function fetchData() {
+            try {
+                elements.apiStatus.textContent = "请求中...";
+                elements.apiStatus.style.color = "#4361ee";
+                
+                const response = await fetch(apiUrl);
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(`API错误: ${data.message}`);
+                }
+                
+                // 更新流量数据
+                const totalGB = bytesToGB(data.plan_monthly_data);
+                const usedGB = bytesToGB(data.data_counter);
+                const remainingGB = (totalGB - usedGB).toFixed(2);
+                const usagePercentage = ((usedGB / totalGB) * 100).toFixed(1);
+                
+                elements.totalData.textContent = `${totalGB} GB`;
+                elements.usedData.textContent = `${usedGB} GB`;
+                elements.remainingData.textContent = `${remainingGB} GB`;
+                elements.usageProgress.style.width = `${usagePercentage}%`;
+                elements.usagePercentage.textContent = `${usagePercentage}%`;
+                
+                // 更新重置时间
+                const resetDate = timestampToDate(data.data_next_reset);
+                elements.resetDate.textContent = resetDate;
+                elements.countdown.textContent = calculateCountdown(data.data_next_reset);
+                
+                // 更新VPS信息
+                elements.hostname.textContent = data.hostname || '--';
+                elements.ipAddress.textContent = data.ip_addresses ? data.ip_addresses[0] : '--';
+                elements.location.textContent = data.node_location || '--';
+                elements.os.textContent = data.os || '--';
+                
+                // 更新状态和时间
+                elements.apiStatus.textContent = "请求成功";
+                elements.apiStatus.style.color = "#90be6d";
+                elements.updateTime.textContent = new Date().toLocaleString('zh-CN');
+                
+            } catch (error) {
+                elements.apiStatus.textContent = `错误: ${error.message}`;
+                elements.apiStatus.style.color = "#f94144";
+                console.error('获取数据失败:', error);
+            }
+        }
+        
+        // 初始化页面
+        function initPage() {
+            fetchData();
+            elements.refreshBtn.addEventListener('click', fetchData);
+            
+            // 每5分钟自动刷新
+            setInterval(fetchData, 5 * 60 * 1000);
+            
+            // 每分钟更新倒计时
+            setInterval(() => {
+                if (elements.countdown.textContent !== '--') {
+                    // 从API重新获取最新重置时间戳会更准确
+                    // 这里简化处理，实际项目中应考虑存储最新时间戳
+                    const currentText = elements.countdown.textContent;
+                    if (!currentText.includes('--') && currentText !== '已重置') {
+                        // 模拟倒计时更新
+                        const parts = currentText.split(' ');
+                        const timeParts = parts[1].split(':');
+                        let seconds = parseInt(timeParts[2]);
+                        let minutes = parseInt(timeParts[1]);
+                        let hours = parseInt(timeParts[0]);
+                        let days = parseInt(parts[0]);
+                        
+                        seconds--;
+                        if (seconds < 0) {
+                            seconds = 59;
+                            minutes--;
+                            if (minutes < 0) {
+                                minutes = 59;
+                                hours--;
+                                if (hours < 0) {
+                                    hours = 23;
+                                    days--;
+                                    if (days < 0) {
+                                        elements.countdown.textContent = '已重置';
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        elements.countdown.textContent = 
+                            `${days}天 ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                    }
+                }
+            }, 1000);
+        }
+        
+        // 页面加载完成后初始化
+        window.addEventListener('DOMContentLoaded', initPage);
+    </script>
+</body>
+</html>
