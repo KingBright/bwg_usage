@@ -1,26 +1,25 @@
 #!/bin/bash
 set -e
 
-# 配置信息 (NAS)
-SERVER="root@your-nas-domain.com"
-SSH_PORT="your_nas_ssh_port"
-APP_DIR="/opt/bwg_usage"
-BINARY_NAME="bwg_usage"
-DOMAIN="your-nas-domain.com:8443"
-
-# 本地读取 .env 中的 API 凭证
+# 1. 本地读取并导出 .env 中的 API 凭证及环境变量
 if [ -f .env ]; then
     export $(cat .env | grep -v '^#' | xargs)
 fi
 
+# 2. 配置信息 (NAS) - 优先从环境变量/.env读取，默认回落到占位符
+SERVER=${SERVER:-"root@your-nas-domain.com"}
+SSH_PORT=${SSH_PORT:-"your_nas_ssh_port"}
+APP_DIR=${APP_DIR:-"/opt/bwg_usage"}
+BINARY_NAME=${BINARY_NAME:-"bwg_usage"}
+DOMAIN=${DOMAIN:-"your-nas-domain.com:8443"}
+PORT=${PORT:-"18082"}
+
+# 3. 搬瓦工 VPS 的 SSH 连接信息 - 优先从环境变量/.env读取，默认回落到占位符
+VPS_SSH_HOST=${VPS_SSH_HOST:-"your_vps_ip_here"}
+VPS_SSH_PORT=${VPS_SSH_PORT:-"your_vps_ssh_port"}
+VPS_SSH_USER=${VPS_SSH_USER:-"root"}
 VEID=${VEID:-"your_bwg_veid"}
 API_KEY=${API_KEY:-"private_yourBwgApiKeyHere"}
-PORT="18082"
-
-# 搬瓦工 VPS 的 SSH 连接信息
-VPS_SSH_HOST="your_vps_ip_here"
-VPS_SSH_PORT="your_vps_ssh_port"
-VPS_SSH_USER="root"
 
 echo ">>> 1. 本地交叉编译 Rust 代码 (Linux x64 musl)..."
 ./build_linux.sh
