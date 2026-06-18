@@ -216,8 +216,13 @@ pub fn start_client_report_loop(
             device_name, report_url, singbox_api_url
         );
 
+        let report_interval = std::env::var("REPORT_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(600);
+
         loop {
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(report_interval)).await;
 
             let connections_url = format!("{}/connections", singbox_api_url.trim_end_matches('/'));
             let resp = match client.get(&connections_url).send().await {
