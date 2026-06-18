@@ -145,6 +145,9 @@ pub async fn switch_local_node(node_name: &str, current_node_lock: Arc<RwLock<St
         return Err("未能在配置文件中定位到 tag 为 'proxy' 的代理出口 outbound 项".to_string());
     }
 
+    // 确保对大盘主域的直连分流配置已注入
+    let _ = ensure_hackerlife_bypass(&mut json_val);
+
     let new_data = serde_json::to_string_pretty(&json_val)
         .map_err(|e| format!("序列化新配置失败: {}", e))?;
 
@@ -198,3 +201,85 @@ impl<T> OptionExt<T> for Option<T> {
         self.ok_or_else(err_fn)
     }
 }
+
+pub fn ensure_hackerlife_bypass(json_val: &mut Value) -> bool {
+    let route = match json_val.get_mut("route") {
+        Some(r) => r,
+        None => return false,
+    };
+    let rules = match route.get_mut("rules").and_then(|r| r.as_array_mut()) {
+        Some(r) => r,
+        None => return false,
+    };
+
+    let mut exists = false;
+    for rule in rules.iter() {
+        if rule.get("outbound").and_then(|o| o.as_str()) == Some("direct") {
+            if let Some(suffix_arr) = rule.get("domain_suffix").and_then(|s| s.as_array()) {
+                if suffix_arr.iter().any(|v| v.as_str() == Some("control.example.invalid")) {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !exists {
+        println!(">>> sing-box 路由规则中缺失 control.example.invalid 的直连规则，正在自动注入...");
+        let new_rule = serde_json::json!({
+            "domain_suffix": ["control.example.invalid"],
+            "outbound": "direct"
+        });
+        rules.insert(0, new_rule);
+        true
+    } else {
+        false
+    }
+}
+
+pub async fn check_and_apply_hackerlife_bypass() -> Result<(), String> {
+    let config_path = get_singbox_config_path();
+    if !std::path::Path::new(&config_path).exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("无法读取 sing-box 配置文件: {}", e))?;
+
+    let mut json_val: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("解析 sing-box 配置文件失败: {}", e))?;
+
+    if ensure_hackerlife_bypass(&mut json_val) {
+        let new_data = serde_json::to_string_pretty(&json_val)
+            .map_err(|e| format!("序列化新配置失败: {}", e))?;
+
+        let temp_path = get_temp_check_path();
+        fs::write(&temp_path, &new_data)
+            .map_err(|e| format!("写入临时检查文件失败: {}", e))?;
+
+        let check_output = Command::new(get_singbox_bin())
+            .args(&["check", "-c", &temp_path])
+            .output()
+            .map_err(|e| format!("无法启动 sing-box 进行语法校验: {}", e))?;
+
+        if !check_output.status.success() {
+            let err_msg = String::from_utf8_lossy(&check_output.stderr).to_string();
+            return Err(format!("新配置语法校验失败: {}", err_msg));
+        }
+
+        fs::write(&config_path, &new_data)
+            .map_err(|e| format!("配置通过语法校验，但在覆盖正式配置文件时失败: {}", e))?;
+
+        println!(">>> 已自动更新本地 sing-box 配置文件以让 control.example.invalid 直连，正在重启 sing-box 服务...");
+        let restart_cmd = std::env::var("SINGBOX_RESTART_CMD")
+            .unwrap_or_else(|_| "brew services restart sing-box".to_string());
+        
+        let parts: Vec<&str> = restart_cmd.split_whitespace().collect();
+        if !parts.is_empty() {
+            let _ = Command::new(parts[0])
+                .args(&parts[1..])
+                .output();
+        }
+    }
+    Ok(())
+}
+

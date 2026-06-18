@@ -32,6 +32,16 @@ pub struct NodeHistory {
 pub struct NasTrafficHistory {
     pub devices: HashMap<String, DeviceHistory>,
     pub nodes: HashMap<String, NodeHistory>,
+    // 每日代理 API / 域名流量累计
+    #[serde(default)]
+    pub daily_api_traffic: HashMap<String, i64>,
+    #[serde(default)]
+    pub daily_api_date: String,
+    // 每周代理 API / 域名流量累计
+    #[serde(default)]
+    pub weekly_api_traffic: HashMap<String, i64>,
+    #[serde(default)]
+    pub weekly_api_week: i32,
 }
 
 pub type ServerHistoryState = Arc<RwLock<NasTrafficHistory>>;
@@ -44,6 +54,10 @@ pub fn load_nas_history(file_path: &str) -> NasTrafficHistory {
         NasTrafficHistory {
             devices: HashMap::new(),
             nodes: HashMap::new(),
+            daily_api_traffic: HashMap::new(),
+            daily_api_date: String::new(),
+            weekly_api_traffic: HashMap::new(),
+            weekly_api_week: 0,
         }
     }
 }
@@ -129,6 +143,10 @@ impl ClientTrafficTracker {
             let id = &conn.id;
             let host = &conn.metadata.host;
             if host.is_empty() {
+                continue;
+            }
+            // 排除对大盘大本营和控制层域名（直连）的流量统计上报
+            if host == "bwg-usage.example.invalid" || host.ends_with(".control.example.invalid") || host == "control.example.invalid" {
                 continue;
             }
             current_ids.insert(id.clone());

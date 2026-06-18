@@ -526,6 +526,7 @@
                         <thead>
                             <tr>
                                 <th>时间 (美东)</th>
+                                <th>次数</th>
                                 <th>客户端源 IP</th>
                                 <th>动作</th>
                                 <th>目标</th>
@@ -534,7 +535,7 @@
                         </thead>
                         <tbody id="log-body">
                             <tr>
-                                <td colspan="5" class="empty-logs">
+                                <td colspan="6" class="empty-logs">
                                     <i class="fas fa-spinner spinning"></i><br>正在加载异常明细...
                                 </td>
                             </tr>
@@ -771,7 +772,7 @@
             if (!logs || logs.length === 0) {
                 elements.logBody.innerHTML = `
                     <tr>
-                        <td colspan="5" class="empty-logs">
+                        <td colspan="6" class="empty-logs">
                             <i class="fas fa-shield-check"></i><br>暂无任何异常直连流量记录，您的代理分流一切正常！
                         </td>
                     </tr>
@@ -786,6 +787,7 @@
                 html += `
                     <tr>
                         <td style="color: var(--text-secondary); font-size: 0.82rem;">${shortTime}</td>
+                        <td style="font-weight: bold; color: var(--warning); font-size: 0.85rem; font-family: monospace;">${log.count || 1} 次</td>
                         <td style="font-family: monospace; font-size: 0.85rem;">${log.source}</td>
                         <td>${log.action === 'accepted' ? '<span style="color: var(--success);">允许</span>' : '<span style="color: var(--danger);">拦截</span>'}</td>
                         <td style="font-weight: 500; font-family: monospace; color: #a5b4fc; word-break: break-all;">${log.target}</td>

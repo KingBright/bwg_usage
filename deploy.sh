@@ -47,8 +47,64 @@ for i in "${!hosts_arr[@]}"; do
     
     echo ">>> 开始部署 VPS 侧统计守护进程 [${host}:${port}] (用户: ${user})..."
     
-    # 确保远程目录存在
-    ssh -o StrictHostKeyChecking=no -p $port $user@$host "mkdir -p /usr/local/bin"
+    # 确保远程目录存在并停止服务以释放文件锁定
+    ssh -o StrictHostKeyChecking=no -p $port $user@$host "mkdir -p /usr/local/bin && systemctl stop v2ray-traffic || true"
+    
+    # 屏蔽指定黑名单域名 (在 VPS 端 v2ray 级别阻断访问)
+    echo ">>> 配置 VPS v2ray 路由规则以屏蔽特定黑名单域名..."
+    python_script='
+import json
+import sys
+
+path = "/etc/v2ray/config.json"
+try:
+    with open(path, "r") as f:
+        data = json.load(f)
+except Exception as e:
+    print("ERROR_READ: " + str(e))
+    sys.exit(1)
+
+rules = data.setdefault("routing", {}).setdefault("rules", [])
+target_domains = [
+    "domain:mirrors.tuna.tsinghua.edu.cn",
+    "domain:internal-api-lark-api.feishu.cn"
+]
+
+found = False
+for rule in rules:
+    if rule.get("outboundTag") == "block" and set(rule.get("domain", [])) == set(target_domains):
+        found = True
+        break
+
+if not found:
+    new_rule = {
+        "type": "field",
+        "domain": target_domains,
+        "outboundTag": "block"
+    }
+    insert_idx = 0
+    for idx, rule in enumerate(rules):
+        if "api" in rule.get("inboundTag", []):
+            insert_idx = idx + 1
+            break
+    rules.insert(insert_idx, new_rule)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        print("UPDATED")
+    except Exception as e:
+        print("ERROR_WRITE: " + str(e))
+        sys.exit(1)
+else:
+    print("NO_CHANGE")
+'
+    
+    res=$(ssh -o StrictHostKeyChecking=no -p $port $user@$host "python3 -c '$python_script'" || echo "FAILED")
+    echo ">>> 路由配置修改状态: $res"
+    if [ "$res" = "UPDATED" ]; then
+        echo ">>> 检测到路由配置已更新，正在重启 v2ray 服务..."
+        ssh -o StrictHostKeyChecking=no -p $port $user@$host "systemctl restart v2ray"
+    fi
     
     # 上传 Linux 静态编译 Rust 二进制至 VPS
     scp -O -o StrictHostKeyChecking=no -P $port $TARGET_DIR/x86_64-unknown-linux-musl/release/bwg_usage $user@$host:/usr/local/bin/bwg_usage

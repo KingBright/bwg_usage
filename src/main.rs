@@ -138,6 +138,12 @@ pub struct LogRecord {
     pub action: String,
     pub target: String,
     pub strategy: String,
+    #[serde(default = "default_count")]
+    pub count: usize,
+}
+
+fn default_count() -> usize {
+    1
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -428,6 +434,7 @@ async fn fetch_single_vps_data(host: String, port: String, user: String) -> Resu
                     action: caps.get(3).map_or("", |m| m.as_str()).to_string(),
                     target: caps.get(5).map_or("", |m| m.as_str()).to_string(),
                     strategy: caps.get(6).map_or("", |m| m.as_str()).to_string(),
+                    count: 1,
                 });
             } else {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -456,6 +463,7 @@ async fn fetch_single_vps_data(host: String, port: String, user: String) -> Resu
                             action: action_str,
                             target: target_str,
                             strategy: strategy_str,
+                            count: 1,
                         });
                     }
                 }
@@ -540,8 +548,39 @@ async fn fetch_abnormal_traffic() {
         }
     }
 
-    // 按时间降序排序合并后的所有国内异常记录
-    all_records.sort_by(|a, b| b.time.cmp(&a.time));
+    // 按网址（不含端口的域名/IP）对异常记录进行合并、计数并保留最新的一条状态
+    let mut merged_records = HashMap::new();
+    for rec in all_records {
+        let key = match rec.target.rfind(':') {
+            Some(idx) => rec.target[..idx].to_string(),
+            None => rec.target.clone(),
+        };
+        if key.is_empty() {
+            continue;
+        }
+
+        let existing = merged_records.entry(key).or_insert(LogRecord {
+            time: String::new(),
+            source: String::new(),
+            action: String::new(),
+            target: String::new(),
+            strategy: String::new(),
+            count: 0,
+        });
+
+        existing.count += 1;
+        if existing.time.is_empty() || rec.time > existing.time {
+            existing.time = rec.time;
+            existing.source = rec.source;
+            existing.action = rec.action;
+            existing.target = rec.target;
+            existing.strategy = rec.strategy;
+        }
+    }
+
+    let mut final_records: Vec<LogRecord> = merged_records.into_values().collect();
+    // 按照最新时间降序排序
+    final_records.sort_by(|a, b| b.time.cmp(&a.time));
 
     // 计算全局所有代理域名请求频次排行 Top 10
     let mut top_domains: Vec<TopDomain> = all_domain_requests
@@ -554,8 +593,8 @@ async fn fetch_abnormal_traffic() {
     }
 
     // 截取最新的 20 条日志
-    if all_records.len() > 20 {
-        all_records.truncate(20);
+    if final_records.len() > 20 {
+        final_records.truncate(20);
     }
 
     // 转换域名流量统计并排序 (所有代理域名流量排行 Top 10)
@@ -570,7 +609,7 @@ async fn fetch_abnormal_traffic() {
 
     let mut response_guard = ABNORMAL_RESPONSE.write().await;
     *response_guard = AbnormalTrafficResponse {
-        records: all_records,
+        records: final_records,
         top_domains,
         domain_traffics,
     };
@@ -606,6 +645,56 @@ async fn abnormal_traffic_handler() -> impl IntoResponse {
         .into_response()
 }
 
+#[derive(Serialize)]
+struct ApiTrafficItem {
+    domain: String,
+    bytes: i64,
+}
+
+#[derive(Serialize)]
+struct ApiTrafficResponse {
+    daily: Vec<ApiTrafficItem>,
+    weekly: Vec<ApiTrafficItem>,
+}
+
+async fn api_traffic_handler(
+    State(state): State<ServerHistoryState>,
+) -> impl IntoResponse {
+    let history = state.read().await;
+
+    // 转换每日统计并排序 Top 10
+    let mut daily: Vec<ApiTrafficItem> = history.daily_api_traffic
+        .iter()
+        .map(|(k, &v)| ApiTrafficItem { domain: k.clone(), bytes: v })
+        .collect();
+    daily.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    if daily.len() > 10 {
+        daily.truncate(10);
+    }
+
+    // 转换每周统计并排序 Top 10
+    let mut weekly: Vec<ApiTrafficItem> = history.weekly_api_traffic
+        .iter()
+        .map(|(k, &v)| ApiTrafficItem { domain: k.clone(), bytes: v })
+        .collect();
+    weekly.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    if weekly.len() > 10 {
+        weekly.truncate(10);
+    }
+
+    let resp = ApiTrafficResponse { daily, weekly };
+
+    (
+        StatusCode::OK,
+        [
+            ("Access-Control-Allow-Origin", "*"),
+            ("Content-Type", "application/json"),
+        ],
+        Json(resp),
+    )
+        .into_response()
+}
+
 // ==========================================
 // NAS 服务端接口处理器
 // ==========================================
@@ -616,12 +705,13 @@ async fn report_handler(
     Json(payload): Json<TrafficReportRequest>,
 ) -> impl IntoResponse {
     let mut history = state.write().await;
+    let now = Local::now();
 
     // 更新设备流量和活跃状态
     let dev = history.devices.entry(payload.device_name.clone()).or_default();
     dev.total_download += payload.download_delta;
     dev.total_upload += payload.upload_delta;
-    dev.last_seen = Local::now().timestamp();
+    dev.last_seen = now.timestamp();
     dev.current_node = payload.current_node_ip.clone();
 
     // 更新节点累计流量
@@ -633,6 +723,30 @@ async fn report_handler(
         let node = history.nodes.entry(cleaned_ip).or_default();
         node.total_download += payload.download_delta;
         node.total_upload += payload.upload_delta;
+    }
+
+    // 处理代理 API 实时流量每日/每周的累计统计
+    let today_str = now.format("%Y-%m-%d").to_string();
+    let this_week = now.iso_week().week() as i32;
+
+    // 跨天检查与清空重置
+    if history.daily_api_date != today_str {
+        history.daily_api_traffic.clear();
+        history.daily_api_date = today_str;
+    }
+
+    // 跨周检查与清空重置
+    if history.weekly_api_week != this_week {
+        history.weekly_api_traffic.clear();
+        history.weekly_api_week = this_week;
+    }
+
+    // 累加实时流量
+    for (domain, bytes) in &payload.domain_deltas {
+        if *bytes > 0 {
+            *history.daily_api_traffic.entry(domain.clone()).or_insert(0) += bytes;
+            *history.weekly_api_traffic.entry(domain.clone()).or_insert(0) += bytes;
+        }
     }
 
     save_nas_history(NAS_HISTORY_PATH, &history);
@@ -895,6 +1009,7 @@ async fn run_server() {
         .route("/api/report", post(report_handler))
         .route("/api/devices", get(get_devices_handler))
         .route("/api/nodes", get(get_nodes_handler)) // 仅保留 GET 路由
+        .route("/api/api_traffic", get(api_traffic_handler))
         .with_state(nas_history)
         .fallback_service(ServeDir::new(static_dir));
 
@@ -909,6 +1024,11 @@ async fn run_server() {
 
 async fn run_daemon() {
     println!(">>> 启动本地客户端守护进程...");
+    
+    if let Err(e) = node::check_and_apply_hackerlife_bypass().await {
+        eprintln!("⚠️  自动配置 sing-box 大盘域名直连绕过失败: {}", e);
+    }
+
     let device_name = std::env::var("DEVICE_NAME").unwrap_or_else(|_| "MacBook".to_string());
     let nas_server_url = std::env::var("NAS_SERVER_URL").unwrap_or_else(|_| "https://your-nas-domain.com:8443".to_string());
     let singbox_api_url = std::env::var("SINGBOX_CLASH_API").unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
@@ -1194,11 +1314,13 @@ async fn run_v2ray_traffic_analyzer() {
             let mut r_guard = domain_requests.write().await;
             *t_guard = data.traffic;
             *r_guard = data.requests;
+            
             println!("已载入历史统计：{} 个域名的流量，{} 个域名的频次", t_guard.len(), r_guard.len());
         } else if let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&content) {
             // 容错载入旧流量单 Map 格式
             let mut t_guard = domain_traffic.write().await;
             *t_guard = map;
+            
             println!("已从旧格式载入历史流量统计：{} 个域名", t_guard.len());
         }
     }
@@ -1252,6 +1374,9 @@ async fn run_v2ray_traffic_analyzer() {
                                             Some(idx) => &target_str[..idx],
                                             None => target_str,
                                         };
+                                        
+
+
                                         // 记录端口到域名映射
                                         let mut guard = p_to_d.write().await;
                                         guard.insert(port, domain.to_string());
