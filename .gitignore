@@ -11,3 +11,5 @@ nas_traffic_history.json
 nas_abnormal_traffic.json
 bwg_usage
 static/*.recovered
+*.log
+*.err
