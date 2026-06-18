@@ -10,7 +10,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,18 +374,11 @@ async fn history_handler() -> impl IntoResponse {
         .into_response()
 }
 
-// 远程 SSH 拉取异常流量数据
-async fn fetch_abnormal_traffic() {
-    let host = std::env::var("VPS_SSH_HOST").unwrap_or_default();
-    let port = std::env::var("VPS_SSH_PORT").unwrap_or_default();
-    let user = std::env::var("VPS_SSH_USER").unwrap_or_default();
-
-    if host.is_empty() || port.is_empty() || user.is_empty() {
-        return;
-    }
-
-    let cmd_str = "tail -n 10000 /var/log/v2ray/access.log | grep -E '(alipay|baidu|bilibili|bytedance|feishu|qq|taobao|tencent|weibo|zhihu|\\.cn:)'";
-    let output = match tokio::process::Command::new("ssh")
+// 远程单个 VPS 数据拉取
+async fn fetch_single_vps_data(host: String, port: String, user: String) -> Result<(Vec<LogRecord>, HashMap<String, i64>, HashMap<String, i64>), String> {
+    let cmd_str = "tail -n 10000 /var/log/v2ray/access.log | grep -E '(alipay|baidu|bilibili|bytedance|feishu|qq|taobao|tencent|weibo|zhihu|\\.cn:)' || true; echo '===TRAFFIC_JSON==='; cat /var/log/v2ray/domain_traffic.json 2>/dev/null || echo '{}'";
+    
+    let output = tokio::process::Command::new("ssh")
         .args(&[
             "-o",
             "StrictHostKeyChecking=no",
@@ -397,123 +391,192 @@ async fn fetch_abnormal_traffic() {
         ])
         .output()
         .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("远程 SSH 抓取异常流量日志失败: {}", e);
-            return;
-        }
-    };
+        .map_err(|e| format!("执行 SSH 失败 ({}@{}): {}", user, host, e))?;
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
+    
     let mut records = Vec::new();
-
+    let mut traffic_map = HashMap::new();
+    let mut requests_map = HashMap::new();
+    
+    let mut in_json = false;
+    let mut json_str = String::new();
+    
     let reg = Regex::new(r"^([\d/]+\s+[\d:]+)\s+([\d\.:]+)\s+(accepted|rejected|rejected\s+again)\s+(tcp|udp):([\w\.\-]+:\d+)\s+\[([\w\-]+)\]").unwrap();
+    
+    #[derive(Deserialize)]
+    struct VpsTrafficData {
+        traffic: HashMap<String, i64>,
+        requests: HashMap<String, i64>,
+    }
 
     for line in stdout_str.lines() {
-        if let Some(caps) = reg.captures(line) {
-            records.push(LogRecord {
-                time: caps.get(1).map_or("", |m| m.as_str()).to_string(),
-                source: caps.get(2).map_or("", |m| m.as_str()).to_string(),
-                action: caps.get(3).map_or("", |m| m.as_str()).to_string(),
-                target: caps.get(5).map_or("", |m| m.as_str()).to_string(),
-                strategy: caps.get(6).map_or("", |m| m.as_str()).to_string(),
-            });
+        if line == "===TRAFFIC_JSON===" {
+            in_json = true;
+            continue;
+        }
+        
+        if in_json {
+            json_str.push_str(line);
+            json_str.push('\n');
         } else {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
-                let time_str = format!("{} {}", parts[0], parts[1]);
-                let source_str = parts[2].to_string();
-                let action_str = parts[3].to_string();
-                let mut target_str = String::new();
-                let mut strategy_str = String::new();
+            // 解析 access.log 日志行 (只用于异常明细表格)
+            if let Some(caps) = reg.captures(line) {
+                records.push(LogRecord {
+                    time: caps.get(1).map_or("", |m| m.as_str()).to_string(),
+                    source: caps.get(2).map_or("", |m| m.as_str()).to_string(),
+                    action: caps.get(3).map_or("", |m| m.as_str()).to_string(),
+                    target: caps.get(5).map_or("", |m| m.as_str()).to_string(),
+                    strategy: caps.get(6).map_or("", |m| m.as_str()).to_string(),
+                });
+            } else {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 6 {
+                    let time_str = format!("{} {}", parts[0], parts[1]);
+                    let source_str = parts[2].to_string();
+                    let action_str = parts[3].to_string();
+                    let mut target_str = String::new();
+                    let mut strategy_str = String::new();
 
-                for &part in &parts {
-                    if part.starts_with("tcp:") || part.starts_with("udp:") {
-                        if let Some(idx) = part.find(':') {
-                            target_str = part[idx + 1..].to_string();
+                    for &part in &parts {
+                        if part.starts_with("tcp:") || part.starts_with("udp:") {
+                            if let Some(idx) = part.find(':') {
+                                target_str = part[idx + 1..].to_string();
+                            }
+                        }
+                        if part.starts_with('[') && part.ends_with(']') {
+                            strategy_str = part.trim_matches(|c| c == '[' || c == ']').to_string();
                         }
                     }
-                    if part.starts_with('[') && part.ends_with(']') {
-                        strategy_str = part.trim_matches(|c| c == '[' || c == ']').to_string();
-                    }
-                }
 
-                if !target_str.is_empty() {
-                    records.push(LogRecord {
-                        time: time_str,
-                        source: source_str,
-                        action: action_str,
-                        target: target_str,
-                        strategy: strategy_str,
-                    });
+                    if !target_str.is_empty() {
+                        records.push(LogRecord {
+                            time: time_str,
+                            source: source_str,
+                            action: action_str,
+                            target: target_str,
+                            strategy: strategy_str,
+                        });
+                    }
                 }
             }
         }
     }
-
-    records.sort_by(|a, b| b.time.cmp(&a.time));
-
-    let mut domain_counts = HashMap::new();
-    for rec in &records {
-        let mut domain = rec.target.clone();
-        if let Some(idx) = domain.find(':') {
-            domain = domain[..idx].to_string();
+    
+    if !json_str.trim().is_empty() {
+        if let Ok(data) = serde_json::from_str::<VpsTrafficData>(&json_str) {
+            traffic_map = data.traffic;
+            requests_map = data.requests;
+        } else if let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&json_str) {
+            traffic_map = map;
         }
-        *domain_counts.entry(domain).or_insert(0) += 1;
+    }
+    
+    Ok((records, traffic_map, requests_map))
+}
+
+// 远程 SSH 拉取所有 VPS 流量与请求频次数据并进行合并
+async fn fetch_abnormal_traffic() {
+    let hosts_env = std::env::var("VPS_SSH_HOSTS").unwrap_or_default();
+    let ports_env = std::env::var("VPS_SSH_PORTS").unwrap_or_default();
+    let users_env = std::env::var("VPS_SSH_USERS").unwrap_or_default();
+
+    let mut nodes = Vec::new();
+
+    if !hosts_env.is_empty() {
+        let hosts: Vec<&str> = hosts_env.split(',').collect();
+        let ports: Vec<&str> = ports_env.split(',').collect();
+        let users: Vec<&str> = users_env.split(',').collect();
+
+        for i in 0..hosts.len() {
+            let host = hosts[i].trim().to_string();
+            if host.is_empty() {
+                continue;
+            }
+            let port = ports.get(i).unwrap_or(&"22").trim().to_string();
+            let user = users.get(i).unwrap_or(&"root").trim().to_string();
+            nodes.push((host, port, user));
+        }
+    } else {
+        // 兼容单 VPS 配置
+        let host = std::env::var("VPS_SSH_HOST").unwrap_or_default();
+        let port = std::env::var("VPS_SSH_PORT").unwrap_or_default();
+        let user = std::env::var("VPS_SSH_USER").unwrap_or_default();
+        if !host.is_empty() {
+            nodes.push((host, port, user));
+        }
     }
 
-    let mut top_domains: Vec<TopDomain> = domain_counts
+    if nodes.is_empty() {
+        return;
+    }
+
+    let mut tasks = Vec::new();
+    for (host, port, user) in nodes {
+        tasks.push(tokio::spawn(async move {
+            match fetch_single_vps_data(host.clone(), port.clone(), user.clone()).await {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    eprintln!("拉取 VPS ({}:{}) 数据失败: {}", host, port, e);
+                    None
+                }
+            }
+        }));
+    }
+
+    let mut all_records = Vec::new();
+    let mut all_domain_traffics = HashMap::new();
+    let mut all_domain_requests = HashMap::new();
+
+    for task in tasks {
+        if let Ok(Some((records, domain_traffics, domain_requests))) = task.await {
+            all_records.extend(records);
+            for (domain, bytes) in domain_traffics {
+                *all_domain_traffics.entry(domain).or_insert(0) += bytes;
+            }
+            for (domain, count) in domain_requests {
+                *all_domain_requests.entry(domain).or_insert(0) += count;
+            }
+        }
+    }
+
+    // 按时间降序排序合并后的所有国内异常记录
+    all_records.sort_by(|a, b| b.time.cmp(&a.time));
+
+    // 计算全局所有代理域名请求频次排行 Top 10
+    let mut top_domains: Vec<TopDomain> = all_domain_requests
         .into_iter()
-        .map(|(domain, count)| TopDomain { domain, count })
+        .map(|(domain, count)| TopDomain { domain, count: count as usize })
         .collect();
     top_domains.sort_by(|a, b| b.count.cmp(&a.count));
     if top_domains.len() > 10 {
         top_domains.truncate(10);
     }
 
-    if records.len() > 20 {
-        records.truncate(20);
+    // 截取最新的 20 条日志
+    if all_records.len() > 20 {
+        all_records.truncate(20);
     }
 
-    let traffic_cmd = "cat /var/log/v2ray/domain_traffic.json 2>/dev/null || echo '{}'";
+    // 转换域名流量统计并排序 (所有代理域名流量排行 Top 10)
     let mut domain_traffics = Vec::new();
-
-    if let Ok(out_t) = tokio::process::Command::new("ssh")
-        .args(&[
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=5",
-            "-p",
-            &port,
-            &format!("{}@{}", user, host),
-            traffic_cmd,
-        ])
-        .output()
-        .await
-    {
-        let stdout_t_str = String::from_utf8_lossy(&out_t.stdout);
-        if let Ok(traffic_map) = serde_json::from_str::<HashMap<String, i64>>(&stdout_t_str) {
-            for (domain, bytes) in traffic_map {
-                domain_traffics.push(DomainTraffic { domain, bytes });
-            }
-            domain_traffics.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-            if domain_traffics.len() > 10 {
-                domain_traffics.truncate(10);
-            }
-        }
+    for (domain, bytes) in all_domain_traffics {
+        domain_traffics.push(DomainTraffic { domain, bytes });
+    }
+    domain_traffics.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    if domain_traffics.len() > 10 {
+        domain_traffics.truncate(10);
     }
 
     let mut response_guard = ABNORMAL_RESPONSE.write().await;
     *response_guard = AbnormalTrafficResponse {
-        records,
+        records: all_records,
         top_domains,
         domain_traffics,
     };
 
     save_abnormal_traffic(&response_guard).await;
-    println!("成功更新 Rust 异常流量缓存明细与排行，并写入持久化。");
+    println!("成功更新全局合并后的异常明细与所有代理流量/频次排行缓存，并写入持久化。");
 }
 
 fn start_abnormal_traffic_poller() {
@@ -1108,11 +1171,208 @@ async fn run_cli_node_add(args: &[String]) {
     }
 }
 
+// 纯 Rust 实现的 VPS 域名流量与频次统计分析逻辑
+async fn run_v2ray_traffic_analyzer() {
+    println!("纯 Rust VPS 域名流量与频次统计分析服务已启动...");
+
+    let log_file_path = "/var/log/v2ray/access.log";
+    let output_file = "/var/log/v2ray/domain_traffic.json";
+
+    #[derive(Serialize, Deserialize, Clone, Default)]
+    struct VpsTrafficData {
+        traffic: HashMap<String, i64>,
+        requests: HashMap<String, i64>,
+    }
+
+    // 1. 初始化，尝试读取历史域名流量与频次记录以保持数据连续性
+    let domain_traffic = Arc::new(RwLock::new(HashMap::<String, i64>::new()));
+    let domain_requests = Arc::new(RwLock::new(HashMap::<String, i64>::new()));
+    
+    if let Ok(content) = fs::read_to_string(output_file) {
+        if let Ok(data) = serde_json::from_str::<VpsTrafficData>(&content) {
+            let mut t_guard = domain_traffic.write().await;
+            let mut r_guard = domain_requests.write().await;
+            *t_guard = data.traffic;
+            *r_guard = data.requests;
+            println!("已载入历史统计：{} 个域名的流量，{} 个域名的频次", t_guard.len(), r_guard.len());
+        } else if let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&content) {
+            // 容错载入旧流量单 Map 格式
+            let mut t_guard = domain_traffic.write().await;
+            *t_guard = map;
+            println!("已从旧格式载入历史流量统计：{} 个域名", t_guard.len());
+        }
+    }
+
+    let port_to_domain = Arc::new(RwLock::new(HashMap::<u16, String>::new()));
+    let active_connections = Arc::new(RwLock::new(HashMap::<u16, i64>::new()));
+
+    // 2. 启动文件追加读取任务监控日志，统计所有域名请求频次并关联端口
+    let p_to_d = Arc::clone(&port_to_domain);
+    let d_reqs = Arc::clone(&domain_requests);
+    tokio::spawn(async move {
+        let mut check_count = 0;
+        while !std::path::Path::new(log_file_path).exists() {
+            if check_count % 30 == 0 {
+                println!("等待日志文件 {} 创建...", log_file_path);
+            }
+            check_count += 1;
+            sleep(Duration::from_secs(2)).await;
+        }
+
+        let file = match File::open(log_file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("错误: 无法打开日志文件: {}", e);
+                return;
+            }
+        };
+        let mut reader = BufReader::new(file);
+        let _ = reader.seek(SeekFrom::End(0));
+
+        let mut line = String::new();
+        let reg = Regex::new(r"accepted\s+(?:tcp|udp):([\w\.\-]+:\d+)").unwrap();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // 没有新数据，睡眠 500ms
+                    sleep(Duration::from_millis(500)).await;
+                }
+                Ok(_) => {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 5 && line.contains("accepted") {
+                        let source_str = parts[2];
+                        if let Some(colon_idx) = source_str.rfind(':') {
+                            if let Ok(port) = source_str[colon_idx + 1..].parse::<u16>() {
+                                if let Some(caps) = reg.captures(&line) {
+                                    if let Some(target) = caps.get(1) {
+                                        let target_str = target.as_str();
+                                        let domain = match target_str.find(':') {
+                                            Some(idx) => &target_str[..idx],
+                                            None => target_str,
+                                        };
+                                        // 记录端口到域名映射
+                                        let mut guard = p_to_d.write().await;
+                                        guard.insert(port, domain.to_string());
+                                        
+                                        // 累加所有域名请求频次
+                                        let mut req_guard = d_reqs.write().await;
+                                        *req_guard.entry(domain.to_string()).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取日志新行出错: {}", e);
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    // 3. 主循环，每 3 秒运行 `ss` 扫描套接字流量并进行统计累加与持久化
+    let reg_sent = Regex::new(r"bytes_sent:(\d+)").unwrap();
+    let reg_recv = Regex::new(r"(?:bytes_received|bytes_acked):(\d+)").unwrap();
+    let reg_conn = Regex::new(r#"users:\(\("(?:v2ray|xray)""#).unwrap();
+
+    loop {
+        sleep(Duration::from_secs(3)).await;
+
+        let output = match tokio::process::Command::new("ss")
+            .args(&["-t", "-p", "-i", "-H"])
+            .output()
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("运行 ss 命令失败: {}", e);
+                continue;
+            }
+        };
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout_str.lines().collect();
+        let mut current_active_ports = std::collections::HashSet::new();
+
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if reg_conn.is_match(line) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 5 {
+                    let remote_str = parts[4];
+                    if let Some(colon_idx) = remote_str.rfind(':') {
+                        if let Ok(port) = remote_str[colon_idx + 1..].parse::<u16>() {
+                            current_active_ports.insert(port);
+
+                            if i + 1 < lines.len() {
+                                let next_line = lines[i + 1];
+                                let sent = reg_sent.captures(next_line)
+                                    .and_then(|c| c.get(1))
+                                    .and_then(|m| m.as_str().parse::<i64>().ok())
+                                    .unwrap_or(0);
+                                let recv = reg_recv.captures(next_line)
+                                    .and_then(|c| c.get(1))
+                                    .and_then(|m| m.as_str().parse::<i64>().ok())
+                                    .unwrap_or(0);
+                                let total_bytes = sent + recv;
+
+                                let p_to_d = port_to_domain.read().await;
+                                if let Some(domain) = p_to_d.get(&port) {
+                                    let mut active_conns_guard = active_connections.write().await;
+                                    let mut domain_traffic_guard = domain_traffic.write().await;
+
+                                    if let Some(&last) = active_conns_guard.get(&port) {
+                                        let delta = total_bytes - last;
+                                        if delta > 0 {
+                                            *domain_traffic_guard.entry(domain.clone()).or_insert(0) += delta;
+                                        }
+                                    }
+                                    active_conns_guard.insert(port, total_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+
+        // 清理已断开的连接以防内存无限增长
+        {
+            let mut active_conns_guard = active_connections.write().await;
+            let mut p_to_d = port_to_domain.write().await;
+            active_conns_guard.retain(|port, _| current_active_ports.contains(port));
+            p_to_d.retain(|port, _| current_active_ports.contains(port));
+        }
+
+        // 定期写入 JSON 持久化 (以双 Map 格式输出)
+        let content = {
+            let t_guard = domain_traffic.read().await;
+            let r_guard = domain_requests.read().await;
+            let data = VpsTrafficData {
+                traffic: t_guard.clone(),
+                requests: r_guard.clone(),
+            };
+            serde_json::to_string_pretty(&data).ok()
+        };
+        if let Some(json_str) = content {
+            let _ = fs::write(output_file, json_str);
+        }
+    }
+}
+
 fn print_help() {
     println!("BandwagonHost & sing-box 分布式流量统计与本地节点管理工具");
     println!("用法:");
     println!("  bwg_usage server                       运行于 NAS 端，启动公共 Web 大盘与上报服务");
     println!("  bwg_usage daemon                       运行于 Mac 本地，启动后台守护进程进行流量采集和上报");
+    println!("  bwg_usage v2ray-traffic                运行于 VPS 端，纯 Rust 域名流量统计分析守护进程");
     println!("  bwg_usage status                       查看本机当前的流量使用情况和节点状态");
     println!("  bwg_usage node list                    列出本机保存的所有节点配置");
     println!("  bwg_usage node switch <tag>            一键应用并热重载切换到指定节点");
@@ -1139,6 +1399,7 @@ async fn main() {
     match args[1].as_str() {
         "server" => run_server().await,
         "daemon" => run_daemon().await,
+        "v2ray-traffic" => run_v2ray_traffic_analyzer().await,
         "status" => run_cli_status().await,
         "node" => {
             if args.len() < 3 {

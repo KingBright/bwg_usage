@@ -65,6 +65,20 @@ pub struct TrafficReportRequest {
     pub download_delta: i64,
     pub upload_delta: i64,
     pub current_node_ip: String,
+    pub domain_deltas: HashMap<String, i64>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ClashConnectionMetadata {
+    pub host: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ClashConnection {
+    pub id: String,
+    pub metadata: ClashConnectionMetadata,
+    pub upload: i64,
+    pub download: i64,
 }
 
 // sing-box Clash Connections API 数据结构
@@ -73,13 +87,15 @@ pub struct TrafficReportRequest {
 pub struct ClashAPIConnections {
     pub download_total: i64,
     pub upload_total: i64,
+    pub connections: Option<Vec<ClashConnection>>,
 }
 
-// 客户端状态：用于记录上一次的绝对总流量
+// 客户端状态：用于记录上一次的绝对总流量以及活跃连接明细
 #[derive(Default)]
 pub struct ClientTrafficTracker {
     pub last_download: i64,
     pub last_upload: i64,
+    pub active_conns: HashMap<String, (String, i64, i64)>, // id -> (host, last_download, last_upload)
 }
 
 impl ClientTrafficTracker {
@@ -102,6 +118,46 @@ impl ClientTrafficTracker {
         self.last_upload = current_upload;
 
         (download_delta, upload_delta)
+    }
+
+    /// 增量计算当前所有活跃连接产生的各个域名的流量 Delta
+    pub fn calculate_domain_deltas(&mut self, connections: &[ClashConnection]) -> HashMap<String, i64> {
+        let mut deltas = HashMap::new();
+        let mut current_ids = std::collections::HashSet::new();
+
+        for conn in connections {
+            let id = &conn.id;
+            let host = &conn.metadata.host;
+            if host.is_empty() {
+                continue;
+            }
+            current_ids.insert(id.clone());
+
+            let cur_dl = conn.download;
+            let cur_ul = conn.upload;
+
+            if let Some((_, last_dl, last_ul)) = self.active_conns.get(id) {
+                let dl_delta = (cur_dl - last_dl).max(0);
+                let ul_delta = (cur_ul - last_ul).max(0);
+                let total = dl_delta + ul_delta;
+                if total > 0 {
+                    *deltas.entry(host.clone()).or_insert(0) += total;
+                }
+            } else {
+                // 新连接，将已经发生的流量做第一次计入
+                let total = cur_dl + cur_ul;
+                if total > 0 {
+                    *deltas.entry(host.clone()).or_insert(0) += total;
+                }
+            }
+
+            self.active_conns.insert(id.clone(), (host.clone(), cur_dl, cur_ul));
+        }
+
+        // 清理在当前活跃列表里已经不存在的连接
+        self.active_conns.retain(|id, _| current_ids.contains(id));
+
+        deltas
     }
 }
 
@@ -165,6 +221,13 @@ pub fn start_client_report_loop(
             // 计算增量
             let (dl_delta, ul_delta) = tracker.calculate_delta(data.download_total, data.upload_total);
 
+            // 增量计算各个域名的流量 Delta
+            let domain_deltas = if let Some(conns) = &data.connections {
+                tracker.calculate_domain_deltas(conns)
+            } else {
+                HashMap::new()
+            };
+
             // 获取当前激活的节点
             let active_node = {
                 let guard = current_node_lock.read().await;
@@ -186,6 +249,7 @@ pub fn start_client_report_loop(
                 download_delta: dl_delta,
                 upload_delta: ul_delta,
                 current_node_ip: node_ip,
+                domain_deltas,
             };
 
             if let Err(e) = client.post(&report_url).json(&req_body).send().await {

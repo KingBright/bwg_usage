@@ -26,32 +26,59 @@ echo ">>> 1. 本地交叉编译 Rust 代码 (Linux x64 musl)..."
 TARGET_DIR=$(cargo metadata --format-version 1 | grep -o '"target_directory":"[^"]*"' | head -n 1 | cut -d':' -f2 | tr -d '"')
 TARGET_DIR=${TARGET_DIR:-"./target"}
 
-echo ">>> 2. 部署 VPS 侧域名流量统计脚本..."
-# 上传脚本至 VPS 并赋予执行权限
-scp -O -o StrictHostKeyChecking=no -P $VPS_SSH_PORT traffic_analyzer.py $VPS_SSH_USER@$VPS_SSH_HOST:/etc/v2ray/sh/traffic_analyzer.py
-ssh -o StrictHostKeyChecking=no -p $VPS_SSH_PORT $VPS_SSH_USER@$VPS_SSH_HOST "chmod +x /etc/v2ray/sh/traffic_analyzer.py"
+echo ">>> 2. 部署 VPS 侧监控程序 (纯 Rust 版)..."
+# 解析多 VPS SSH
+if [ -n "$VPS_SSH_HOSTS" ]; then
+    # 以逗号分割为数组
+    IFS=',' read -r -a hosts_arr <<< "$VPS_SSH_HOSTS"
+    IFS=',' read -r -a ports_arr <<< "$VPS_SSH_PORTS"
+    IFS=',' read -r -a users_arr <<< "$VPS_SSH_USERS"
+else
+    # 兼容单 VPS
+    hosts_arr=("$VPS_SSH_HOST")
+    ports_arr=("$VPS_SSH_PORT")
+    users_arr=("$VPS_SSH_USER")
+fi
 
-# 配置 VPS 上的 Systemd 守护进程
-cat <<EOF > traffic_analyzer.service
+for i in "${!hosts_arr[@]}"; do
+    host="${hosts_arr[$i]}"
+    port="${ports_arr[$i]:-22}"
+    user="${users_arr[$i]:-root}"
+    
+    echo ">>> 开始部署 VPS 侧统计守护进程 [${host}:${port}] (用户: ${user})..."
+    
+    # 确保远程目录存在
+    ssh -o StrictHostKeyChecking=no -p $port $user@$host "mkdir -p /usr/local/bin"
+    
+    # 上传 Linux 静态编译 Rust 二进制至 VPS
+    scp -O -o StrictHostKeyChecking=no -P $port $TARGET_DIR/x86_64-unknown-linux-musl/release/bwg_usage $user@$host:/usr/local/bin/bwg_usage
+    ssh -o StrictHostKeyChecking=no -p $port $user@$host "chmod +x /usr/local/bin/bwg_usage"
+    
+    # 生成 Systemd 服务文件并上传
+    cat <<EOF > v2ray-traffic.service
 [Unit]
-Description=V2Ray Domain Traffic Analyzer Daemon
+Description=V2Ray Domain Traffic Analyzer Daemon (Rust)
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 /etc/v2ray/sh/traffic_analyzer.py
+ExecStart=/usr/local/bin/bwg_usage v2ray-traffic
 Restart=always
 
 [Install]
 WantedBy=network.target
 EOF
 
-scp -O -o StrictHostKeyChecking=no -P $VPS_SSH_PORT traffic_analyzer.service $VPS_SSH_USER@$VPS_SSH_HOST:/etc/systemd/system/traffic_analyzer.service
-rm traffic_analyzer.service
-
-# 重启 VPS 上的统计服务
-ssh -o StrictHostKeyChecking=no -p $VPS_SSH_PORT $VPS_SSH_USER@$VPS_SSH_HOST "systemctl daemon-reload && systemctl enable traffic_analyzer && systemctl restart traffic_analyzer"
+    scp -O -o StrictHostKeyChecking=no -P $port v2ray-traffic.service $user@$host:/etc/systemd/system/v2ray-traffic.service
+    rm -f v2ray-traffic.service
+    
+    # 停止原有的 python 脚本服务并清理
+    ssh -o StrictHostKeyChecking=no -p $port $user@$host "systemctl stop traffic_analyzer || true; systemctl disable traffic_analyzer || true; rm -f /etc/systemd/system/traffic_analyzer.service /etc/v2ray/sh/traffic_analyzer.py || true"
+    
+    # 启动新的 rust 服务
+    ssh -o StrictHostKeyChecking=no -p $port $user@$host "systemctl daemon-reload && systemctl enable v2ray-traffic && systemctl restart v2ray-traffic"
+done
 
 echo ">>> 3. 准备 NAS 上的远程部署目录..."
 ssh -p $SSH_PORT $SERVER "mkdir -p $APP_DIR $APP_DIR/static"
@@ -72,6 +99,9 @@ STATIC_DIR=$APP_DIR/static
 VPS_SSH_HOST=$VPS_SSH_HOST
 VPS_SSH_PORT=$VPS_SSH_PORT
 VPS_SSH_USER=$VPS_SSH_USER
+VPS_SSH_HOSTS=$VPS_SSH_HOSTS
+VPS_SSH_PORTS=$VPS_SSH_PORTS
+VPS_SSH_USERS=$VPS_SSH_USERS
 EOF
 
 scp -O -P $SSH_PORT config.env $SERVER:$APP_DIR/config.env

@@ -499,7 +499,7 @@
 
             <!-- Top 10 排行 (col-4) -->
             <div class="card col-4">
-                <h2><i class="fas fa-list-ol" style="color: var(--warning);"></i> 误走代理域名分析 Top 10</h2>
+                <h2><i class="fas fa-list-ol" style="color: var(--warning);"></i> 代理流量与频次分析 Top 10</h2>
                 <!-- Tabs -->
                 <div class="top-switch-tabs">
                     <button class="top-tab active" id="tab-count">请求次数排行</button>
@@ -513,9 +513,10 @@
             </div>
         </div>
 
-        <!-- 实时异常流量明细 -->
+        <!-- 实时异常流量明细 与 API 流量分析 -->
         <div class="grid-layout">
-            <div class="card col-12">
+            <!-- 实时异常流量明细 (col-8) -->
+            <div class="card col-8">
                 <h2><i class="fas fa-shield-exclamation" style="color: var(--warning);"></i> 疑似异常直连流量明细 (最新20条)</h2>
                 <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 24px;">
                     误经代理转发的最新连接列表(时间、目标、策略)
@@ -541,6 +542,21 @@
                     </table>
                 </div>
             </div>
+
+            <!-- 代理 API 流量分析 Top 10 (col-4) -->
+            <div class="card col-4">
+                <h2><i class="fas fa-chart-bar" style="color: var(--cyan);"></i> 代理 API 流量分析 Top 10</h2>
+                <!-- Tabs -->
+                <div class="top-switch-tabs">
+                    <button class="top-tab active" id="api-tab-day">本日排行</button>
+                    <button class="top-tab" id="api-tab-week">本周排行</button>
+                </div>
+                <div class="top-domains-list" id="api-traffic-list">
+                    <div class="empty-logs" style="padding: 20px 0;">
+                        <i class="fas fa-spinner spinning" style="font-size: 1.25rem;"></i><br>加载中...
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -554,13 +570,19 @@
             tabCount: document.getElementById('tab-count'),
             tabTraffic: document.getElementById('tab-traffic'),
             bwgServersContainer: document.getElementById('bwg-servers-container'),
-            devicesTrafficBody: document.getElementById('devices-traffic-body')
+            devicesTrafficBody: document.getElementById('devices-traffic-body'),
+            apiTrafficList: document.getElementById('api-traffic-list'),
+            apiTabDay: document.getElementById('api-tab-day'),
+            apiTabWeek: document.getElementById('api-tab-week')
         };
 
         let dailyChartInstance = null;
         let weeklyChartInstance = null;
         let cacheAbnormalData = null;
         let currentTab = 'count'; // 'count' 或 'traffic'
+
+        let cacheApiTrafficData = null;
+        let currentApiTab = 'day'; // 'day' 或 'week'
 
         function bytesToGB(bytes) {
             return (bytes / 1073741824).toFixed(2);
@@ -891,6 +913,54 @@
             }
         }
 
+        // 获取并同步 API 流量分析排行
+        async function fetchApiTraffic() {
+            try {
+                const resp = await fetch('api/api_traffic');
+                if (resp.ok) {
+                    cacheApiTrafficData = await resp.json();
+                    renderApiTraffic();
+                }
+            } catch (err) {
+                console.error("同步 API 流量分析排行失败:", err);
+            }
+        }
+
+        // 渲染 API 流量排行榜
+        function renderApiTraffic() {
+            if (!cacheApiTrafficData) return;
+
+            const list = currentApiTab === 'day' ? cacheApiTrafficData.daily : cacheApiTrafficData.weekly;
+
+            if (!list || list.length === 0) {
+                elements.apiTrafficList.innerHTML = `
+                    <div class="empty-logs" style="padding: 20px 0;">
+                        <i class="fas fa-info-circle" style="color: var(--text-secondary); font-size: 1.5rem;"></i><br>暂无流量排行数据<br><span style="font-size:0.75rem;">(等待客户端上报...)</span>
+                    </div>
+                `;
+                return;
+            }
+
+            const maxBytes = list[0].bytes;
+            let html = '';
+            list.forEach(item => {
+                const widthPercent = maxBytes > 0 ? (item.bytes / maxBytes * 100) : 0;
+                const readableSize = formatBytes(item.bytes);
+                html += `
+                    <div class="top-domain-item">
+                        <div class="top-domain-meta">
+                            <span class="top-domain-name" title="${item.domain}">${item.domain}</span>
+                            <span class="top-domain-count" style="color: var(--cyan);">${readableSize}</span>
+                        </div>
+                        <div class="top-domain-bar-bg">
+                            <div class="top-domain-bar-fill blue-bar" style="width: ${widthPercent}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+            elements.apiTrafficList.innerHTML = html;
+        }
+
         // 全量数据刷新
         async function fetchAllData() {
             const refreshIcon = elements.refreshBtn.querySelector('i');
@@ -927,6 +997,9 @@
                 // 4. 获取局域网终端流量
                 await fetchDevicesList();
 
+                // 5. 获取代理 API 流量分析排行
+                await fetchApiTraffic();
+
                 elements.apiStatus.textContent = "系统连接正常";
             } catch (error) {
                 console.error("全局刷新遇到未知异常:", error);
@@ -956,9 +1029,24 @@
                 renderLogsAndTabs();
             });
 
+            elements.apiTabDay.addEventListener('click', () => {
+                elements.apiTabWeek.classList.remove('active');
+                elements.apiTabDay.classList.add('active');
+                currentApiTab = 'day';
+                renderApiTraffic();
+            });
+
+            elements.apiTabWeek.addEventListener('click', () => {
+                elements.apiTabDay.classList.remove('active');
+                elements.apiTabWeek.classList.add('active');
+                currentApiTab = 'week';
+                renderApiTraffic();
+            });
+
             // 5 秒定时轮询终端和多服务器状态
             setInterval(fetchDevicesList, 5000);
             setInterval(fetchPublicNodes, 5000);
+            setInterval(fetchApiTraffic, 10000); // 10秒轮询一次API流量
 
             // 每 15 分钟自动全局同步一次
             setInterval(fetchAllData, 15 * 60 * 1000);
