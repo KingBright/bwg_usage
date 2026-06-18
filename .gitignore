@@ -1,1 +1,13 @@
 .env
+
+# Added by cargo
+
+/target
+
+# Local private configuration and cache files
+bwg_servers.json
+client_nodes.json
+nas_traffic_history.json
+nas_abnormal_traffic.json
+bwg_usage
+static/*.recovered
