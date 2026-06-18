@@ -116,7 +116,7 @@ chmod +x /usr/local/bin/bwh_helper
   ```json
   [
     {
-      "name": "旧搬瓦工 VPS",
+      "name": "VPS-01",
       "veid": "your_bwg_veid",
       "api_key": "private_yourBwgApiKeyHere",
       "ip": "12.34.56.78"
