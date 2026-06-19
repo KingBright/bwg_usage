@@ -483,12 +483,13 @@
                                 <th>当前出站节点 IP</th>
                                 <th>累计已用下载</th>
                                 <th>累计已用上传</th>
+                                <th>异常代理流量</th>
                                 <th>累计消耗总量</th>
                             </tr>
                         </thead>
                         <tbody id="devices-traffic-body">
                             <tr>
-                                <td colspan="6" class="empty-logs" style="padding: 40px 0;">
+                                <td colspan="7" class="empty-logs" style="padding: 40px 0;">
                                     <i class="fas fa-spinner spinning"></i><br>正在加载终端监控数据...
                                 </td>
                             </tr>
@@ -551,6 +552,8 @@
                 <div class="top-switch-tabs">
                     <button class="top-tab active" id="api-tab-day">本日排行</button>
                     <button class="top-tab" id="api-tab-week">本周排行</button>
+                    <button class="top-tab" id="api-tab-abnormal-day">异常本日</button>
+                    <button class="top-tab" id="api-tab-abnormal-week">异常本周</button>
                 </div>
                 <div class="top-domains-list" id="api-traffic-list">
                     <div class="empty-logs" style="padding: 20px 0;">
@@ -574,7 +577,9 @@
             devicesTrafficBody: document.getElementById('devices-traffic-body'),
             apiTrafficList: document.getElementById('api-traffic-list'),
             apiTabDay: document.getElementById('api-tab-day'),
-            apiTabWeek: document.getElementById('api-tab-week')
+            apiTabWeek: document.getElementById('api-tab-week'),
+            apiTabAbnormalDay: document.getElementById('api-tab-abnormal-day'),
+            apiTabAbnormalWeek: document.getElementById('api-tab-abnormal-week')
         };
 
         let dailyChartInstance = null;
@@ -596,6 +601,39 @@
             const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        async function apiFetch(url, options = {}, retryAuth = true) {
+            const headers = new Headers(options.headers || {});
+            const token = localStorage.getItem('bwgDashboardToken');
+            if (token && !headers.has('Authorization')) {
+                headers.set('Authorization', `Bearer ${token}`);
+            }
+
+            const resp = await fetch(url, { ...options, headers });
+            if ((resp.status === 401 || resp.status === 503) && retryAuth) {
+                const nextToken = window.prompt('请输入大盘访问 Token');
+                if (nextToken && nextToken.trim()) {
+                    localStorage.setItem('bwgDashboardToken', nextToken.trim());
+                    return apiFetch(url, options, false);
+                }
+            }
+            return resp;
+        }
+
+        function activateApiTab(tab) {
+            [elements.apiTabDay, elements.apiTabWeek, elements.apiTabAbnormalDay, elements.apiTabAbnormalWeek]
+                .forEach(btn => btn.classList.remove('active'));
+            tab.classList.add('active');
         }
 
         function timestampToDate(timestamp) {
@@ -726,10 +764,11 @@
                     let html = '';
                     topDomains.forEach(item => {
                         const widthPercent = maxCount > 0 ? (item.count / maxCount * 100) : 0;
+                        const domain = escapeHtml(item.domain);
                         html += `
                             <div class="top-domain-item">
                                 <div class="top-domain-meta">
-                                    <span class="top-domain-name" title="${item.domain}">${item.domain}</span>
+                                    <span class="top-domain-name" title="${domain}">${domain}</span>
                                     <span class="top-domain-count">${item.count} 次</span>
                                 </div>
                                 <div class="top-domain-bar-bg">
@@ -753,10 +792,11 @@
                     domainTraffics.forEach(item => {
                         const widthPercent = maxBytes > 0 ? (item.bytes / maxBytes * 100) : 0;
                         const readableSize = formatBytes(item.bytes);
+                        const domain = escapeHtml(item.domain);
                         html += `
                             <div class="top-domain-item">
                                 <div class="top-domain-meta">
-                                    <span class="top-domain-name" title="${item.domain}">${item.domain}</span>
+                                    <span class="top-domain-name" title="${domain}">${domain}</span>
                                     <span class="top-domain-count" style="color: var(--cyan);">${readableSize}</span>
                                 </div>
                                 <div class="top-domain-bar-bg">
@@ -782,16 +822,20 @@
 
             let html = '';
             logs.forEach(log => {
+                const strategy = escapeHtml(log.strategy || '');
                 const badgeClass = log.strategy === 'block' ? 'badge-danger' : (log.strategy === 'direct' ? 'badge-warning' : 'badge-success');
-                const shortTime = log.time.length > 5 ? log.time.substring(5) : log.time;
+                const shortTime = escapeHtml((log.time || '').length > 5 ? log.time.substring(5) : log.time);
+                const source = escapeHtml(log.source);
+                const target = escapeHtml(log.target);
+                const reason = escapeHtml(log.reason || log.category || '');
                 html += `
                     <tr>
                         <td style="color: var(--text-secondary); font-size: 0.82rem;">${shortTime}</td>
                         <td style="font-weight: bold; color: var(--warning); font-size: 0.85rem; font-family: monospace;">${log.count || 1} 次</td>
-                        <td style="font-family: monospace; font-size: 0.85rem;">${log.source}</td>
+                        <td style="font-family: monospace; font-size: 0.85rem;">${source}</td>
                         <td>${log.action === 'accepted' ? '<span style="color: var(--success);">允许</span>' : '<span style="color: var(--danger);">拦截</span>'}</td>
-                        <td style="font-weight: 500; font-family: monospace; color: #a5b4fc; word-break: break-all;">${log.target}</td>
-                        <td><span class="badge ${badgeClass}">${log.strategy}</span></td>
+                        <td style="font-weight: 500; font-family: monospace; color: #a5b4fc; word-break: break-all;" title="${reason}">${target}</td>
+                        <td><span class="badge ${badgeClass}" title="${reason}">${strategy || escapeHtml(log.category || '-')}</span></td>
                     </tr>
                 `;
             });
@@ -801,7 +845,7 @@
         // 获取并渲染搬瓦工多服务器大盘及设备关联
         async function fetchPublicNodes() {
             try {
-                const resp = await fetch('api/nodes');
+                const resp = await apiFetch('api/nodes');
                 if (!resp.ok) throw new Error("获取服务器列表失败");
                 const servers = await resp.json();
                 
@@ -820,13 +864,16 @@
                     const limitGB = bytesToGB(srv.official_limit);
                     const pct = srv.official_limit > 0 ? ((srv.official_used / srv.official_limit) * 100).toFixed(1) : 0;
                     const clientAcc = formatBytes(srv.client_accumulated);
+                    const clientAbnormal = formatBytes(srv.client_abnormal || 0);
+                    const serverName = escapeHtml(srv.name);
+                    const serverIp = escapeHtml(srv.ip);
                     
                     const resetTimeStr = srv.next_reset > 0 ? timestampToDate(srv.next_reset) : '未获取';
                     const countdownStr = srv.next_reset > 0 ? calculateCountdown(srv.next_reset) : '--';
                     
                     let devicesHtml = '';
                     if (srv.active_devices && srv.active_devices.length > 0) {
-                        devicesHtml = srv.active_devices.map(d => `<span class="badge badge-success" style="margin-right:4px; margin-top:4px; font-size:0.75rem;">${d}</span>`).join('');
+                        devicesHtml = srv.active_devices.map(d => `<span class="badge badge-success" style="margin-right:4px; margin-top:4px; font-size:0.75rem;">${escapeHtml(d)}</span>`).join('');
                     } else {
                         devicesHtml = '<span style="font-size:0.75rem; color:var(--text-secondary);">暂无活跃连入</span>';
                     }
@@ -834,8 +881,8 @@
                     html += `
                         <div class="server-sub-card">
                             <div style="display: flex; justify-content: space-between; align-items: center;">
-                                <strong style="color: var(--text-primary); font-size: 0.95rem;">${srv.name}</strong>
-                                <span style="font-size: 0.75rem; color: var(--text-secondary); font-family: monospace;">${srv.ip}</span>
+                                <strong style="color: var(--text-primary); font-size: 0.95rem;">${serverName}</strong>
+                                <span style="font-size: 0.75rem; color: var(--text-secondary); font-family: monospace;">${serverIp}</span>
                             </div>
                             
                             <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-secondary);">
@@ -849,6 +896,7 @@
                             
                             <div style="font-size: 0.75rem; color: var(--text-secondary); display: flex; flex-direction: column; gap: 4px; margin-top: 4px;">
                                 <span>客户端累计: <strong style="color: var(--cyan);">${clientAcc}</strong></span>
+                                <span>异常代理: <strong style="color: var(--warning);">${clientAbnormal}</strong></span>
                                 <span>重置日期: <strong style="color: var(--text-primary);">${resetTimeStr}</strong></span>
                                 <span>重置倒计时: <strong style="color: var(--warning);">${countdownStr}</strong></span>
                                 <div style="display: flex; align-items: center; flex-wrap: wrap; margin-top: 2px;">
@@ -868,14 +916,14 @@
         // 轮询获取所有电脑终端的流量
         async function fetchDevicesList() {
             try {
-                const resp = await fetch('api/devices');
+                const resp = await apiFetch('api/devices');
                 if (!resp.ok) throw new Error("获取终端监控数据失败");
                 const devices = await resp.json();
                 
                 if (devices.length === 0) {
                     elements.devicesTrafficBody.innerHTML = `
                         <tr>
-                            <td colspan="6" class="empty-logs" style="padding: 40px 0;">
+                            <td colspan="7" class="empty-logs" style="padding: 40px 0;">
                                 <i class="fas fa-info-circle"></i><br>暂无已上报流量数据的终端设备
                             </td>
                         </tr>
@@ -892,19 +940,26 @@
                     const onlineText = dev.online ? '<span style="color:#10b981; font-weight:600;">在线</span>' : '<span style="color:#ef4444; font-weight:600;">离线</span>';
                     const dl = formatBytes(dev.total_download);
                     const ul = formatBytes(dev.total_upload);
+                    const abnormal = formatBytes(dev.total_abnormal_proxy || 0);
                     const total = formatBytes(dev.total_download + dev.total_upload);
+                    const deviceName = escapeHtml(dev.name);
+                    const currentNode = escapeHtml(dev.current_node || '直连或未知');
+                    const abnormalTitle = (dev.top_abnormal_domains || [])
+                        .map(item => `${item.domain}: ${formatBytes(item.bytes)}`)
+                        .join('\n');
                     
                     html += `
                         <tr>
-                            <td style="font-weight: 600; font-size: 0.95rem; color: #f3f4f6;">${dev.name}</td>
+                            <td style="font-weight: 600; font-size: 0.95rem; color: #f3f4f6;">${deviceName}</td>
                             <td>
                                 <div style="display: flex; align-items: center;">
                                     ${statusDot} ${onlineText}
                                 </div>
                             </td>
-                            <td style="font-weight: 500; color: #a5b4fc; font-family: monospace;">${dev.current_node || '直连或未知'}</td>
+                            <td style="font-weight: 500; color: #a5b4fc; font-family: monospace;">${currentNode}</td>
                             <td style="font-family: monospace; color: var(--text-secondary);">${dl}</td>
                             <td style="font-family: monospace; color: var(--text-secondary);">${ul}</td>
+                            <td style="font-weight: 700; color: var(--warning); font-family: monospace;" title="${escapeHtml(abnormalTitle)}">${abnormal}</td>
                             <td style="font-weight: 700; color: var(--cyan); font-family: monospace;">${total}</td>
                         </tr>
                     `;
@@ -918,7 +973,7 @@
         // 获取并同步 API 流量分析排行
         async function fetchApiTraffic() {
             try {
-                const resp = await fetch('api/api_traffic');
+                const resp = await apiFetch('api/api_traffic');
                 if (resp.ok) {
                     cacheApiTrafficData = await resp.json();
                     renderApiTraffic();
@@ -932,12 +987,15 @@
         function renderApiTraffic() {
             if (!cacheApiTrafficData) return;
 
-            const list = currentApiTab === 'day' ? cacheApiTrafficData.daily : cacheApiTrafficData.weekly;
+            let list = cacheApiTrafficData.daily;
+            if (currentApiTab === 'week') list = cacheApiTrafficData.weekly;
+            if (currentApiTab === 'abnormal_day') list = cacheApiTrafficData.abnormal_daily;
+            if (currentApiTab === 'abnormal_week') list = cacheApiTrafficData.abnormal_weekly;
 
             if (!list || list.length === 0) {
                 elements.apiTrafficList.innerHTML = `
                     <div class="empty-logs" style="padding: 20px 0;">
-                        <i class="fas fa-info-circle" style="color: var(--text-secondary); font-size: 1.5rem;"></i><br>暂无流量排行数据<br><span style="font-size:0.75rem;">(等待客户端上报...)</span>
+                        <i class="fas fa-info-circle" style="color: var(--text-secondary); font-size: 1.5rem;"></i><br>暂无排行数据<br><span style="font-size:0.75rem;">(等待客户端上报...)</span>
                     </div>
                 `;
                 return;
@@ -948,10 +1006,12 @@
             list.forEach(item => {
                 const widthPercent = maxBytes > 0 ? (item.bytes / maxBytes * 100) : 0;
                 const readableSize = formatBytes(item.bytes);
+                const domain = escapeHtml(item.domain);
+                const reason = escapeHtml(item.reason || item.category || '');
                 html += `
                     <div class="top-domain-item">
                         <div class="top-domain-meta">
-                            <span class="top-domain-name" title="${item.domain}">${item.domain}</span>
+                            <span class="top-domain-name" title="${reason || domain}">${domain}</span>
                             <span class="top-domain-count" style="color: var(--cyan);">${readableSize}</span>
                         </div>
                         <div class="top-domain-bar-bg">
@@ -973,7 +1033,7 @@
             try {
                 // 1. 获取历史流量统计数据
                 try {
-                    const historyResp = await fetch('api/history');
+                    const historyResp = await apiFetch('api/history');
                     if (historyResp.ok) {
                         const historyData = await historyResp.json();
                         renderCharts(historyData);
@@ -984,7 +1044,7 @@
 
                 // 2. 获取异常流量与域名流量
                 try {
-                    const logResp = await fetch('api/abnormal_traffic');
+                    const logResp = await apiFetch('api/abnormal_traffic');
                     if (logResp.ok) {
                         cacheAbnormalData = await logResp.json();
                         renderLogsAndTabs();
@@ -1032,16 +1092,26 @@
             });
 
             elements.apiTabDay.addEventListener('click', () => {
-                elements.apiTabWeek.classList.remove('active');
-                elements.apiTabDay.classList.add('active');
+                activateApiTab(elements.apiTabDay);
                 currentApiTab = 'day';
                 renderApiTraffic();
             });
 
             elements.apiTabWeek.addEventListener('click', () => {
-                elements.apiTabDay.classList.remove('active');
-                elements.apiTabWeek.classList.add('active');
+                activateApiTab(elements.apiTabWeek);
                 currentApiTab = 'week';
+                renderApiTraffic();
+            });
+
+            elements.apiTabAbnormalDay.addEventListener('click', () => {
+                activateApiTab(elements.apiTabAbnormalDay);
+                currentApiTab = 'abnormal_day';
+                renderApiTraffic();
+            });
+
+            elements.apiTabAbnormalWeek.addEventListener('click', () => {
+                activateApiTab(elements.apiTabAbnormalWeek);
+                currentApiTab = 'abnormal_week';
                 renderApiTraffic();
             });
 

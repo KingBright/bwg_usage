@@ -7,6 +7,9 @@
 # Local private configuration and cache files
 bwg_servers.json
 client_nodes.json
+client_pending_report.json
+direct_suffixes.txt
+direct_suffixes.json
 nas_traffic_history.json
 nas_abnormal_traffic.json
 bwg_usage
