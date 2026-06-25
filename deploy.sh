@@ -3,7 +3,9 @@ set -e
 
 # 1. 本地读取并导出 .env 中的 API 凭证及环境变量
 if [ -f .env ]; then
-    export $(cat .env | grep -v '^#' | xargs)
+    set -a
+    source .env
+    set +a
 fi
 
 # 2. 配置信息 (NAS) - 优先从环境变量/.env读取，默认回落到占位符
@@ -62,6 +64,12 @@ for i in "${!hosts_arr[@]}"; do
     host="${hosts_arr[$i]}"
     port="${ports_arr[$i]:-22}"
     user="${users_arr[$i]:-root}"
+    
+    echo ">>> 检测 VPS [${host}:${port}] 的 SSH 连通性..."
+    if ! ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -p $port $user@$host "echo 'PING_OK'" > /dev/null 2>&1; then
+        echo "⚠️ 警告: 无法连接至 VPS [${host}:${port}]，跳过该节点的监控部署。"
+        continue
+    fi
     
     echo ">>> 开始部署 VPS 侧统计守护进程 [${host}:${port}] (用户: ${user})..."
     
@@ -252,6 +260,12 @@ EOF
 else
     echo "⚠️  未找到本地 bwg_servers.json，且 VEID/API_KEY/BWG_SERVER_IP 不完整；NAS 将无法显示真实搬瓦工官方流量。"
 fi
+
+echo ">>> 6c. 上传客户端节点配置..."
+if [ -f client_nodes.json ]; then
+    scp -O -P $SSH_PORT client_nodes.json $SERVER:$APP_DIR/client_nodes.json
+fi
+
 
 echo ">>> 7. 配置并上传 NAS Systemd 服务文件..."
 cat <<EOF > bwg_usage.service

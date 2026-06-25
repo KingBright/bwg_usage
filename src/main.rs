@@ -1377,7 +1377,7 @@ async fn get_nodes_handler(
 // ==========================================
 
 struct LocalDaemonState {
-    pub device_name: String,
+    pub device_name: Arc<RwLock<String>>,
     pub nas_server_url: String,
     pub singbox_api_url: String,
     pub current_node: Arc<RwLock<String>>,
@@ -1386,6 +1386,7 @@ struct LocalDaemonState {
 // GET /api/local/status
 async fn get_local_status_handler(State(state): State<Arc<LocalDaemonState>>) -> impl IntoResponse {
     let active_node = state.current_node.read().await.clone();
+    let name = state.device_name.read().await.clone();
 
     let client = reqwest::Client::new();
     let conn_url = format!(
@@ -1422,7 +1423,7 @@ async fn get_local_status_handler(State(state): State<Arc<LocalDaemonState>>) ->
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "device_name": state.device_name,
+            "device_name": name,
             "nas_server_url": state.nas_server_url,
             "current_node": active_node,
             "singbox_online": singbox_online,
@@ -1431,6 +1432,69 @@ async fn get_local_status_handler(State(state): State<Arc<LocalDaemonState>>) ->
             "singbox_total_upload": total_ul,
         })),
     )
+}
+
+// ==========================================
+// 辅助持久化配置机制 (用于保存设备名)
+// ==========================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct HelperConfig {
+    pub device_name: Option<String>,
+}
+
+fn load_helper_config() -> HelperConfig {
+    if let Ok(content) = fs::read_to_string("helper_config.json") {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        HelperConfig::default()
+    }
+}
+
+fn save_helper_config(config: &HelperConfig) {
+    if let Ok(data) = serde_json::to_string_pretty(config) {
+        let _ = fs::write("helper_config.json", data);
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameDeviceRequest {
+    pub name: String,
+}
+
+// POST /api/local/device/rename
+async fn rename_device_handler(
+    State(state): State<Arc<LocalDaemonState>>,
+    Json(req): Json<RenameDeviceRequest>,
+) -> impl IntoResponse {
+    let mut cfg = load_helper_config();
+    cfg.device_name = Some(req.name.clone());
+    save_helper_config(&cfg);
+
+    // 修改内存中的名字
+    let mut name_guard = state.device_name.write().await;
+    *name_guard = req.name.clone();
+
+    println!(">>> 设备名称已修改为 '{}'，正在重启助手服务...", req.name);
+
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::process::exit(1);
+    });
+
+    (StatusCode::OK, format!("设备名称已修改为 '{}'，服务正在重启...", req.name))
+}
+
+// POST /api/local/device/restart
+async fn restart_daemon_handler() -> impl IntoResponse {
+    println!(">>> 收到重启指令，正在重启助手服务...");
+
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::process::exit(1);
+    });
+
+    (StatusCode::OK, "服务正在重启...")
 }
 
 // POST /api/local/switch
@@ -1601,7 +1665,11 @@ async fn run_daemon() {
         }
     }
 
-    let device_name = std::env::var("DEVICE_NAME").unwrap_or_else(|_| "MacBook".to_string());
+    let helper_cfg = load_helper_config();
+    let raw_device_name = helper_cfg.device_name
+        .unwrap_or_else(|| std::env::var("DEVICE_NAME").unwrap_or_else(|_| "MacBook".to_string()));
+    let device_name = Arc::new(RwLock::new(raw_device_name.clone()));
+
     let nas_server_url = std::env::var("NAS_SERVER_URL")
         .unwrap_or_else(|_| "https://your-nas-domain.com:8443".to_string());
     let singbox_api_url =
@@ -1615,7 +1683,7 @@ async fn run_daemon() {
 
     // 启动 5 秒主动上报协程
     start_client_report_loop(
-        device_name.clone(),
+        raw_device_name,
         nas_server_url.clone(),
         singbox_api_url.clone(),
         current_node.clone(),
@@ -1637,6 +1705,8 @@ async fn run_daemon() {
         .route("/api/local/nodes/{name}", delete(delete_local_node_handler))
         .route("/api/local/switch", post(switch_local_node_handler))
         .route("/api/local/singbox/{action}", post(manage_singbox_handler))
+        .route("/api/local/device/rename", post(rename_device_handler))
+        .route("/api/local/device/restart", post(restart_daemon_handler))
         .with_state(daemon_state);
 
     let port: u16 = local_api_port.parse().unwrap_or(9091);
@@ -1829,6 +1899,61 @@ async fn run_cli_node_switch(name: &str) {
         }
         Err(_) => {
             eprintln!("❌ 错误: 连接本地守护进程失败。");
+        }
+    }
+}
+
+async fn run_cli_device_rename(new_name: &str) {
+    let client = get_local_daemon_client();
+    let port = get_local_daemon_port();
+    let url = format!("http://127.0.0.1:{}/api/local/device/rename", port);
+
+    println!(">>> 正在请求本地守护进程将设备名修改为 '{}'...", new_name);
+    match client
+        .post(&url)
+        .json(&serde_json::json!({ "name": new_name }))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                if let Ok(text) = resp.text().await {
+                    println!("🟢 成功: {}", text);
+                }
+            } else {
+                if let Ok(text) = resp.text().await {
+                    println!("🔴 失败: {}", text);
+                } else {
+                    println!("🔴 失败: 状态码 {}", status);
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("❌ 错误: 连接本地守护进程失败。请检查后台守护服务是否已启动。");
+        }
+    }
+}
+
+async fn run_cli_device_restart() {
+    let client = get_local_daemon_client();
+    let port = get_local_daemon_port();
+    let url = format!("http://127.0.0.1:{}/api/local/device/restart", port);
+
+    println!(">>> 正在请求本地守护进程重启...");
+    match client.post(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                if let Ok(text) = resp.text().await {
+                    println!("🟢 成功: {}", text);
+                }
+            } else {
+                println!("🔴 失败: 状态码 {}", status);
+            }
+        }
+        Err(_) => {
+            eprintln!("❌ 错误: 连接本地守护进程失败。请检查后台守护服务是否已启动。");
         }
     }
 }
@@ -2216,6 +2341,8 @@ fn print_help() {
     println!("  bwg_usage node delete <tag>            删除本地的指定节点");
     println!("  bwg_usage node add [options]           手动在本地节点库添加节点");
     println!("  bwg_usage singbox start|stop|restart   通过本地 helper 管理 sing-box 服务");
+    println!("  bwg_usage device rename <new_name>     修改本机在大盘显示的设备别名");
+    println!("  bwg_usage device restart               重启本机 helper 守护进程本身");
     println!("    Options:");
     println!("      --name <name>         节点别名 (必填)");
     println!("      --server <ip_or_host> 服务器主机 (必填)");
@@ -2269,6 +2396,25 @@ async fn main() {
                 }
                 "add" => {
                     run_cli_node_add(&args[3..]).await;
+                }
+                _ => print_help(),
+            }
+        }
+        "device" | "config" => {
+            if args.len() < 3 {
+                print_help();
+                return;
+            }
+            match args[2].as_str() {
+                "rename" | "set-name" => {
+                    if args.len() < 4 {
+                        eprintln!("❌ 错误: 请指定新的设备名称");
+                        return;
+                    }
+                    run_cli_device_rename(&args[3]).await;
+                }
+                "restart" => {
+                    run_cli_device_restart().await;
                 }
                 _ => print_help(),
             }

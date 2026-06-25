@@ -47,8 +47,15 @@ fn get_singbox_bin() -> String {
 }
 
 fn get_temp_check_path() -> String {
-    "/tmp/sing-box-check-config.json".to_string()
+    if cfg!(target_os = "windows") {
+        std::env::var("TEMP")
+            .map(|t| format!("{}\\sing-box-check-config.json", t))
+            .unwrap_or_else(|_| "C:\\Program Files\\sing-box\\check-config.json".to_string())
+    } else {
+        "/tmp/sing-box-check-config.json".to_string()
+    }
 }
+
 
 fn get_brew_bin() -> String {
     std::env::var("BREW_BIN").unwrap_or_else(|_| {
@@ -308,8 +315,21 @@ pub fn detect_active_node_tag(local_nodes: &[NodeConfig]) -> String {
 
     for ob in outbounds {
         if ob.get("tag").and_then(|t| t.as_str()) == Some("proxy") {
-            let current_server = ob.get("server").and_then(|s| s.as_str()).unwrap_or("");
-            let current_port = ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+            let mut current_server = ob.get("server").and_then(|s| s.as_str()).unwrap_or("");
+            let mut current_port = ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+
+            // 如果是 selector 类型，则尝试寻找其默认的底层出口服务器
+            if ob.get("type").and_then(|t| t.as_str()) == Some("selector") {
+                if let Some(default_tag) = ob.get("default").and_then(|d| d.as_str()) {
+                    for other_ob in outbounds {
+                        if other_ob.get("tag").and_then(|t| t.as_str()) == Some(default_tag) {
+                            current_server = other_ob.get("server").and_then(|s| s.as_str()).unwrap_or("");
+                            current_port = other_ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+                            break;
+                        }
+                    }
+                }
+            }
 
             // 在本地节点库匹配
             for node in local_nodes {
@@ -357,7 +377,9 @@ pub async fn switch_local_node(
     let mut found = false;
     for ob in outbounds {
         if ob.get("tag").and_then(|t| t.as_str()) == Some("proxy") {
-            if let Some(template) = &node.outbound {
+            if ob.get("type").and_then(|t| t.as_str()) == Some("selector") {
+                ob["default"] = Value::String(node.name.clone());
+            } else if let Some(template) = &node.outbound {
                 let mut next = template.clone();
                 next["tag"] = Value::String("proxy".to_string());
                 *ob = next;
