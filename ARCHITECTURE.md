@@ -37,6 +37,7 @@
 ### 2.1 本地 Mac 客户端 (`bwh_helper` 守护进程)
 * **技术实现**：以 macOS 系统的 `launchd` 服务常驻后台运行，以 **2秒 1次** 的超高频率请求本地 `sing-box` 的 Clash 控制端口 `/connections`。
 * **sing-box 生命周期管理**：守护进程在 `127.0.0.1:9091` 暴露本地管理接口，CLI 可执行 `bwh_helper singbox start|stop|restart`，节点切换和必要的配置自修复也会调用同一套受控重启逻辑。对于 sudo 启动的 sing-box，helper 只使用非交互式 sudo (`sudo -n`) 和 allowlist 服务命令，避免后台进程卡在密码输入或变成任意命令执行入口。
+* **公司 VPN 动态接口兼容**：启用 `SINGBOX_VPN_PROBE_IP` 后，守护进程会周期性查询该内网目标当前使用的系统接口。若 macOS 在 VPN 重连或重启后把接口从 `utun5` 改为其他编号，helper 只更新指定 `direct` 出站的 `bind_interface`，并要求新接口连续多次稳定后才在 sing-box 全量配置校验通过的前提下自动重启。物理网卡和不匹配的接口会被忽略，自动重启还受冷却时间限制，避免 VPN 离线或接口抖动时频繁中断代理连接。依赖 `/etc/hosts` 的公司域名由该出站的专用 hosts DNS resolver 解析，防止显式 HTTP/SOCKS 代理在拨号阶段受到公共 DNS 负缓存影响。
 * **增量状态机 (Tracker)**：在内存中动态维护一个活跃连接图表（`active_conns`）。每一次采集时，遍历当前连接：
   * 解析出站方向：读取连接的 `chains`。**若 `chains[0] != "proxy"`（非代理），则直接过滤丢弃，不做任何处理。**
   * 排除控制面流量：若连接的 `host` 命中 `CONTROL_DOMAIN_SUFFIXES` 或 `NAS_SERVER_URL` 的域名，直接过滤排除。

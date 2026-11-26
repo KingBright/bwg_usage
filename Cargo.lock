@@ -112,6 +112,7 @@ dependencies = [
  "once_cell",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

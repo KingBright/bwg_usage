@@ -19,7 +19,9 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tower_http::services::ServeDir;
 
+mod landing;
 mod node;
+mod profile;
 mod traffic;
 
 use node::{
@@ -1482,7 +1484,10 @@ async fn rename_device_handler(
         std::process::exit(1);
     });
 
-    (StatusCode::OK, format!("设备名称已修改为 '{}'，服务正在重启...", req.name))
+    (
+        StatusCode::OK,
+        format!("设备名称已修改为 '{}'，服务正在重启...", req.name),
+    )
 }
 
 // POST /api/local/device/restart
@@ -1626,6 +1631,7 @@ async fn run_server() {
     // 初始化搬瓦工与 VPS 日志轮询任务
     start_bwg_collector();
     start_abnormal_traffic_poller();
+    profile::start_node_health_prober();
 
     let nas_history = Arc::new(RwLock::new(load_nas_history(NAS_HISTORY_PATH)));
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "./static".to_string());
@@ -1638,6 +1644,32 @@ async fn run_server() {
         .route("/api/devices", get(get_devices_handler))
         .route("/api/nodes", get(get_nodes_handler)) // 仅保留 GET 路由
         .route("/api/api_traffic", get(api_traffic_handler))
+        .route("/api/profile", get(profile::profile_handler))
+        .route("/z", get(profile::bootstrap_handler))
+        .route("/zephyr", get(landing::zephyr_landing_handler))
+        .route("/zephyr/", get(landing::zephyr_landing_handler))
+        .route("/zephyr/version.json", get(landing::zephyr_version_handler))
+        .route(
+            "/zephyr/desktop-version.json",
+            get(landing::zephyr_desktop_version_handler),
+        )
+        .route("/zephyr/icon.png", get(landing::zephyr_icon_handler))
+        .route(
+            "/zephyr/download/zephyr-latest.apk",
+            get(landing::zephyr_apk_download_handler),
+        )
+        .route(
+            "/zephyr/download/zephyr-macos-arm64.tar.gz",
+            get(landing::zephyr_macos_download_handler),
+        )
+        .route(
+            "/zephyr/download/zephyr-windows-x64.exe",
+            get(landing::zephyr_windows_download_handler),
+        )
+        .route(
+            "/zephyr/download/zephyr-linux-x64",
+            get(landing::zephyr_linux_download_handler),
+        )
         .with_state(nas_history)
         .fallback_service(ServeDir::new(static_dir));
 
@@ -1665,8 +1697,11 @@ async fn run_daemon() {
         }
     }
 
+    node::start_dynamic_vpn_interface_monitor();
+
     let helper_cfg = load_helper_config();
-    let raw_device_name = helper_cfg.device_name
+    let raw_device_name = helper_cfg
+        .device_name
         .unwrap_or_else(|| std::env::var("DEVICE_NAME").unwrap_or_else(|_| "MacBook".to_string()));
     let device_name = Arc::new(RwLock::new(raw_device_name.clone()));
 

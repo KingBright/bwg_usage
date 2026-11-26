@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -46,16 +51,42 @@ fn get_singbox_bin() -> String {
     std::env::var("SINGBOX_BIN").unwrap_or_else(|_| "/opt/homebrew/bin/sing-box".to_string())
 }
 
-fn get_temp_check_path() -> String {
-    if cfg!(target_os = "windows") {
-        std::env::var("TEMP")
-            .map(|t| format!("{}\\sing-box-check-config.json", t))
-            .unwrap_or_else(|_| "C:\\Program Files\\sing-box\\check-config.json".to_string())
-    } else {
-        "/tmp/sing-box-check-config.json".to_string()
+fn get_temp_check_path() -> PathBuf {
+    let process_id = std::process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sing-box-check-config-{}-{}.json",
+        process_id, timestamp
+    ))
+}
+
+struct TempConfigGuard {
+    path: PathBuf,
+}
+
+impl TempConfigGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.path
     }
 }
 
+impl Drop for TempConfigGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn get_singbox_data_dir() -> String {
+    std::env::var("SINGBOX_DATA_DIR")
+        .unwrap_or_else(|_| "/opt/homebrew/var/lib/sing-box".to_string())
+}
 
 fn get_brew_bin() -> String {
     std::env::var("BREW_BIN").unwrap_or_else(|_| {
@@ -74,6 +105,58 @@ pub enum SingboxAction {
     Start,
     Stop,
     Restart,
+}
+
+const DEFAULT_VPN_OUTBOUND_TAG: &str = "vpn-direct";
+const DEFAULT_VPN_INTERFACE_PREFIXES: &str = "utun";
+const DEFAULT_VPN_MONITOR_SECS: u64 = 15;
+const DEFAULT_VPN_STABLE_CHECKS: u32 = 3;
+const DEFAULT_VPN_RESTART_COOLDOWN_SECS: u64 = 600;
+
+#[derive(Clone, Debug)]
+struct DynamicVpnConfig {
+    probe_ip: IpAddr,
+    outbound_tag: String,
+    interface_prefixes: Vec<String>,
+    monitor_interval: Duration,
+    stable_checks: u32,
+    restart_cooldown: Duration,
+}
+
+#[derive(Default)]
+struct StableInterfaceTracker {
+    candidate: Option<String>,
+    observations: u32,
+}
+
+impl StableInterfaceTracker {
+    fn observe(&mut self, interface: Option<&str>, required: u32) -> Option<String> {
+        let Some(interface) = interface else {
+            self.candidate = None;
+            self.observations = 0;
+            return None;
+        };
+
+        if self.candidate.as_deref() == Some(interface) {
+            self.observations = self.observations.saturating_add(1);
+        } else {
+            self.candidate = Some(interface.to_string());
+            self.observations = 1;
+        }
+
+        (self.observations >= required.max(1))
+            .then(|| self.candidate.as_ref().expect("candidate is set").clone())
+    }
+}
+
+fn restart_attempt_allowed(
+    last_attempt: Option<Instant>,
+    now: Instant,
+    cooldown: Duration,
+) -> bool {
+    last_attempt
+        .map(|last| now.saturating_duration_since(last) >= cooldown)
+        .unwrap_or(true)
 }
 
 impl SingboxAction {
@@ -243,7 +326,242 @@ fn singbox_command_for_action(action: SingboxAction) -> Result<Vec<String>, Stri
     Ok(default_singbox_command(action))
 }
 
-pub async fn manage_singbox(action: SingboxAction) -> Result<String, String> {
+fn valid_network_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn configured_dynamic_vpn() -> Result<Option<DynamicVpnConfig>, String> {
+    let raw_probe = match std::env::var("SINGBOX_VPN_PROBE_IP") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let probe_ip = raw_probe
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| "SINGBOX_VPN_PROBE_IP 必须是合法 IP 地址".to_string())?;
+    if probe_ip.is_unspecified() || probe_ip.is_multicast() {
+        return Err("SINGBOX_VPN_PROBE_IP 不能是未指定或组播地址".to_string());
+    }
+
+    let outbound_tag = std::env::var("SINGBOX_VPN_OUTBOUND_TAG")
+        .unwrap_or_else(|_| DEFAULT_VPN_OUTBOUND_TAG.to_string());
+    if !valid_network_name(&outbound_tag) {
+        return Err("SINGBOX_VPN_OUTBOUND_TAG 包含不允许的字符".to_string());
+    }
+
+    let raw_prefixes = std::env::var("SINGBOX_VPN_INTERFACE_PREFIXES")
+        .unwrap_or_else(|_| DEFAULT_VPN_INTERFACE_PREFIXES.to_string());
+    let interface_prefixes: Vec<String> = raw_prefixes
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if interface_prefixes.is_empty() || interface_prefixes.iter().any(|p| !valid_network_name(p)) {
+        return Err("SINGBOX_VPN_INTERFACE_PREFIXES 配置无效".to_string());
+    }
+
+    let monitor_secs = match std::env::var("SINGBOX_VPN_MONITOR_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "SINGBOX_VPN_MONITOR_SECS 必须是整数".to_string())?,
+        Err(_) => DEFAULT_VPN_MONITOR_SECS,
+    }
+    .clamp(5, 3600);
+
+    let stable_checks = match std::env::var("SINGBOX_VPN_STABLE_CHECKS") {
+        Ok(value) => value
+            .parse::<u32>()
+            .map_err(|_| "SINGBOX_VPN_STABLE_CHECKS 必须是整数".to_string())?,
+        Err(_) => DEFAULT_VPN_STABLE_CHECKS,
+    }
+    .clamp(1, 20);
+
+    let restart_cooldown_secs = match std::env::var("SINGBOX_VPN_RESTART_COOLDOWN_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "SINGBOX_VPN_RESTART_COOLDOWN_SECS 必须是整数".to_string())?,
+        Err(_) => DEFAULT_VPN_RESTART_COOLDOWN_SECS,
+    }
+    .clamp(60, 86_400);
+
+    Ok(Some(DynamicVpnConfig {
+        probe_ip,
+        outbound_tag,
+        interface_prefixes,
+        monitor_interval: Duration::from_secs(monitor_secs),
+        stable_checks,
+        restart_cooldown: Duration::from_secs(restart_cooldown_secs),
+    }))
+}
+
+fn parse_route_interface(output: &str) -> Option<String> {
+    let interface = output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "interface").then(|| value.trim())
+    })?;
+    valid_network_name(interface).then(|| interface.to_string())
+}
+
+fn interface_matches_prefixes(interface: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| interface.starts_with(prefix))
+}
+
+async fn detect_vpn_interface(config: &DynamicVpnConfig) -> Result<Option<String>, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config;
+        Ok(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new("/sbin/route")
+                .args(["-n", "get", &config.probe_ip.to_string()])
+                .output(),
+        )
+        .await
+        .map_err(|_| "查询 VPN 路由接口超时".to_string())?
+        .map_err(|e| format!("无法执行 /sbin/route: {}", e))?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let interface = parse_route_interface(&stdout)
+            .ok_or_else(|| "无法从 route 输出中解析安全的接口名".to_string())?;
+        if interface_matches_prefixes(&interface, &config.interface_prefixes) {
+            Ok(Some(interface))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn update_vpn_outbound_interface(
+    json_val: &mut Value,
+    outbound_tag: &str,
+    interface: &str,
+) -> Result<bool, String> {
+    if !valid_network_name(outbound_tag) || !valid_network_name(interface) {
+        return Err("VPN 出站标签或接口名无效".to_string());
+    }
+
+    let outbounds = json_val
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "sing-box 配置中缺少 outbounds 数组".to_string())?;
+    let outbound = outbounds
+        .iter_mut()
+        .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some(outbound_tag))
+        .ok_or_else(|| format!("sing-box 配置中未找到 '{}' 出站", outbound_tag))?;
+    if outbound.get("type").and_then(Value::as_str) != Some("direct") {
+        return Err(format!("'{}' 出站必须是 direct 类型", outbound_tag));
+    }
+    if outbound.get("bind_interface").and_then(Value::as_str) == Some(interface) {
+        return Ok(false);
+    }
+
+    outbound["bind_interface"] = Value::String(interface.to_string());
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn restrict_config_permissions(config_path: &str) -> Result<(), String> {
+    let mut permissions = fs::metadata(config_path)
+        .map_err(|e| format!("无法读取 sing-box 配置权限: {}", e))?
+        .permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(config_path, permissions)
+        .map_err(|e| format!("无法收紧 sing-box 配置权限: {}", e))
+}
+
+#[cfg(not(unix))]
+fn restrict_config_permissions(_config_path: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn write_checked_singbox_config(config_path: &str, json_val: &Value) -> Result<(), String> {
+    let new_data =
+        serde_json::to_string_pretty(json_val).map_err(|e| format!("序列化新配置失败: {}", e))?;
+    let temp_guard = TempConfigGuard::new(get_temp_check_path());
+    let mut temp_options = OpenOptions::new();
+    temp_options.write(true).create_new(true);
+    #[cfg(unix)]
+    temp_options.mode(0o600);
+    let mut temp_file = temp_options
+        .open(temp_guard.path())
+        .map_err(|e| format!("创建私有临时检查文件失败: {}", e))?;
+    temp_file
+        .write_all(new_data.as_bytes())
+        .map_err(|e| format!("写入临时检查文件失败: {}", e))?;
+    drop(temp_file);
+
+    let mut check_command = Command::new(get_singbox_bin());
+    check_command.args(["check", "-c"]);
+    check_command.arg(temp_guard.path());
+    let data_dir = get_singbox_data_dir();
+    if std::path::Path::new(&data_dir).is_dir() {
+        check_command.args(["--directory", &data_dir]);
+    }
+    let check_output = check_command
+        .output()
+        .map_err(|e| format!("无法启动 sing-box 进行语法校验: {}", e));
+    let check_output = check_output?;
+    if !check_output.status.success() {
+        let err_msg = String::from_utf8_lossy(&check_output.stderr);
+        return Err(format!("新配置语法校验失败: {}", err_msg.trim()));
+    }
+
+    restrict_config_permissions(config_path)?;
+    fs::write(config_path, &new_data)
+        .map_err(|e| format!("配置通过语法校验，但覆盖正式配置文件失败: {}", e))
+}
+
+fn apply_dynamic_vpn_interface_with(
+    config: &DynamicVpnConfig,
+    interface: &str,
+) -> Result<bool, String> {
+    let config_path = get_singbox_config_path();
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("无法读取 sing-box 配置文件: {}", e))?;
+    let mut json_val: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 sing-box 配置文件失败: {}", e))?;
+    if !update_vpn_outbound_interface(&mut json_val, &config.outbound_tag, interface)? {
+        return Ok(false);
+    }
+
+    write_checked_singbox_config(&config_path, &json_val)?;
+    Ok(true)
+}
+
+async fn refresh_dynamic_vpn_interface_with(
+    config: &DynamicVpnConfig,
+) -> Result<Option<String>, String> {
+    let Some(interface) = detect_vpn_interface(config).await? else {
+        return Ok(None);
+    };
+    if !apply_dynamic_vpn_interface_with(config, &interface)? {
+        return Ok(None);
+    }
+    Ok(Some(interface))
+}
+
+async fn refresh_dynamic_vpn_interface() -> Result<Option<String>, String> {
+    let Some(config) = configured_dynamic_vpn()? else {
+        return Ok(None);
+    };
+    refresh_dynamic_vpn_interface_with(&config).await
+}
+
+async fn run_singbox_service_command(action: SingboxAction) -> Result<String, String> {
     let parts = singbox_command_for_action(action)?;
     let (program, args) = parts
         .split_first()
@@ -273,6 +591,92 @@ pub async fn manage_singbox(action: SingboxAction) -> Result<String, String> {
         action.as_str(),
         detail
     ))
+}
+
+pub async fn manage_singbox(action: SingboxAction) -> Result<String, String> {
+    if action != SingboxAction::Stop
+        && let Some(interface) = refresh_dynamic_vpn_interface().await?
+    {
+        println!(
+            ">>> 已将 sing-box VPN 直连出站动态更新为接口 {}。",
+            interface
+        );
+    }
+    run_singbox_service_command(action).await
+}
+
+pub fn start_dynamic_vpn_interface_monitor() {
+    let config = match configured_dynamic_vpn() {
+        Ok(Some(config)) => config,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("⚠️  sing-box VPN 动态接口监视未启动: {}", e);
+            return;
+        }
+    };
+
+    println!(
+        ">>> sing-box VPN 动态接口监视已启动：每 {} 秒检测，连续 {} 次稳定后更新，自动重启冷却 {} 秒。",
+        config.monitor_interval.as_secs(),
+        config.stable_checks,
+        config.restart_cooldown.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut tracker = StableInterfaceTracker::default();
+        let mut restart_pending = false;
+        let mut last_restart_attempt: Option<Instant> = None;
+        loop {
+            match detect_vpn_interface(&config).await {
+                Ok(interface) => {
+                    let stable_interface =
+                        tracker.observe(interface.as_deref(), config.stable_checks);
+                    let cooldown_elapsed = restart_attempt_allowed(
+                        last_restart_attempt,
+                        Instant::now(),
+                        config.restart_cooldown,
+                    );
+                    if let Some(interface) = stable_interface
+                        && !restart_pending
+                        && cooldown_elapsed
+                    {
+                        match apply_dynamic_vpn_interface_with(&config, &interface) {
+                            Ok(true) => {
+                                println!(
+                                    ">>> VPN 接口已稳定切换为 {}，配置校验通过，准备重启 sing-box...",
+                                    interface
+                                );
+                                restart_pending = true;
+                            }
+                            Ok(false) => {}
+                            Err(e) => eprintln!("⚠️  自动更新 sing-box VPN 接口失败: {}", e),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("⚠️  自动检测 sing-box VPN 接口失败: {}", e),
+            }
+
+            let restart_allowed = restart_attempt_allowed(
+                last_restart_attempt,
+                Instant::now(),
+                config.restart_cooldown,
+            );
+            if restart_pending && restart_allowed {
+                last_restart_attempt = Some(Instant::now());
+                match run_singbox_service_command(SingboxAction::Restart).await {
+                    Ok(message) => {
+                        println!(">>> VPN 接口自动兼容完成: {}", message);
+                        restart_pending = false;
+                    }
+                    Err(e) => eprintln!(
+                        "⚠️  VPN 接口已更新，但重启 sing-box 失败，将在冷却期后重试: {}",
+                        e
+                    ),
+                }
+            }
+
+            sleep(config.monitor_interval).await;
+        }
+    });
 }
 
 pub async fn restart_singbox() -> Result<String, String> {
@@ -316,17 +720,24 @@ pub fn detect_active_node_tag(local_nodes: &[NodeConfig]) -> String {
     for ob in outbounds {
         if ob.get("tag").and_then(|t| t.as_str()) == Some("proxy") {
             let mut current_server = ob.get("server").and_then(|s| s.as_str()).unwrap_or("");
-            let mut current_port = ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+            let mut current_port =
+                ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
 
             // 如果是 selector 类型，则尝试寻找其默认的底层出口服务器
-            if ob.get("type").and_then(|t| t.as_str()) == Some("selector") {
-                if let Some(default_tag) = ob.get("default").and_then(|d| d.as_str()) {
-                    for other_ob in outbounds {
-                        if other_ob.get("tag").and_then(|t| t.as_str()) == Some(default_tag) {
-                            current_server = other_ob.get("server").and_then(|s| s.as_str()).unwrap_or("");
-                            current_port = other_ob.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
-                            break;
-                        }
+            if ob.get("type").and_then(|t| t.as_str()) == Some("selector")
+                && let Some(default_tag) = ob.get("default").and_then(|d| d.as_str())
+            {
+                for other_ob in outbounds {
+                    if other_ob.get("tag").and_then(|t| t.as_str()) == Some(default_tag) {
+                        current_server = other_ob
+                            .get("server")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        current_port = other_ob
+                            .get("server_port")
+                            .and_then(|p| p.as_u64())
+                            .unwrap_or(0) as u16;
+                        break;
                     }
                 }
             }
@@ -414,30 +825,7 @@ pub async fn switch_local_node(
     // 确保对大盘控制域名的直连分流配置已注入
     let _ = ensure_control_domain_bypass(&mut json_val);
 
-    let new_data =
-        serde_json::to_string_pretty(&json_val).map_err(|e| format!("序列化新配置失败: {}", e))?;
-
-    let temp_path = get_temp_check_path();
-    fs::write(&temp_path, &new_data).map_err(|e| format!("写入临时检查文件失败: {}", e))?;
-
-    // 运行校验
-    let check_output = Command::new(get_singbox_bin())
-        .args(["check", "-c", &temp_path])
-        .output()
-        .map_err(|e| format!("无法启动 sing-box 进行语法校验: {}", e))?;
-
-    if !check_output.status.success() {
-        let err_msg = String::from_utf8_lossy(&check_output.stderr).to_string();
-        return Err(format!("新配置语法校验失败: {}", err_msg));
-    }
-
-    // 覆盖原正式配置
-    fs::write(&config_path, &new_data).map_err(|e| {
-        format!(
-            "配置通过语法校验，但在覆盖正式配置文件时失败（请检查读写权限）: {}",
-            e
-        )
-    })?;
+    write_checked_singbox_config(&config_path, &json_val)?;
 
     // 异步执行重启
     tokio::spawn(async {
@@ -572,24 +960,7 @@ pub async fn check_and_apply_control_domain_bypass() -> Result<(), String> {
         serde_json::from_str(&content).map_err(|e| format!("解析 sing-box 配置文件失败: {}", e))?;
 
     if ensure_control_domain_bypass(&mut json_val) {
-        let new_data = serde_json::to_string_pretty(&json_val)
-            .map_err(|e| format!("序列化新配置失败: {}", e))?;
-
-        let temp_path = get_temp_check_path();
-        fs::write(&temp_path, &new_data).map_err(|e| format!("写入临时检查文件失败: {}", e))?;
-
-        let check_output = Command::new(get_singbox_bin())
-            .args(["check", "-c", &temp_path])
-            .output()
-            .map_err(|e| format!("无法启动 sing-box 进行语法校验: {}", e))?;
-
-        if !check_output.status.success() {
-            let err_msg = String::from_utf8_lossy(&check_output.stderr).to_string();
-            return Err(format!("新配置语法校验失败: {}", err_msg));
-        }
-
-        fs::write(&config_path, &new_data)
-            .map_err(|e| format!("配置通过语法校验，但在覆盖正式配置文件时失败: {}", e))?;
+        write_checked_singbox_config(&config_path, &json_val)?;
 
         println!(">>> 已自动更新本地 sing-box 配置文件以让控制域名直连，正在重启 sing-box 服务...");
         restart_singbox().await?;
@@ -644,5 +1015,166 @@ mod tests {
             Some(SingboxAction::Restart)
         );
         assert_eq!(SingboxAction::from_str("reload"), None);
+    }
+
+    #[test]
+    fn test_parse_route_interface_accepts_macos_route_output() {
+        let output = r#"
+   route to: 10.36.41.104
+destination: 10.36.41.104
+  interface: utun12
+      flags: <UP,HOST,DONE,IFSCOPE>
+"#;
+
+        assert_eq!(parse_route_interface(output), Some("utun12".to_string()));
+    }
+
+    #[test]
+    fn test_parse_route_interface_rejects_unsafe_interface_name() {
+        let output = "interface: utun5;touch /tmp/unsafe\n";
+
+        assert_eq!(parse_route_interface(output), None);
+    }
+
+    #[test]
+    fn test_interface_prefix_allowlist_ignores_physical_interface() {
+        let prefixes = vec!["utun".to_string()];
+
+        assert!(interface_matches_prefixes("utun12", &prefixes));
+        assert!(!interface_matches_prefixes("en0", &prefixes));
+    }
+
+    #[test]
+    fn test_stable_interface_tracker_requires_consecutive_observations() {
+        let mut tracker = StableInterfaceTracker::default();
+
+        assert_eq!(tracker.observe(Some("utun12"), 3), None);
+        assert_eq!(tracker.observe(Some("utun12"), 3), None);
+        assert_eq!(
+            tracker.observe(Some("utun12"), 3),
+            Some("utun12".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stable_interface_tracker_resets_on_route_change() {
+        let mut tracker = StableInterfaceTracker::default();
+
+        assert_eq!(tracker.observe(Some("utun5"), 3), None);
+        assert_eq!(tracker.observe(Some("utun5"), 3), None);
+        assert_eq!(tracker.observe(None, 3), None);
+        assert_eq!(tracker.observe(Some("utun6"), 3), None);
+        assert_eq!(tracker.observe(Some("utun6"), 3), None);
+        assert_eq!(tracker.observe(Some("utun6"), 3), Some("utun6".to_string()));
+    }
+
+    #[test]
+    fn test_restart_attempt_is_blocked_during_cooldown() {
+        let now = Instant::now();
+
+        assert!(!restart_attempt_allowed(
+            Some(now),
+            now + Duration::from_secs(599),
+            Duration::from_secs(600)
+        ));
+    }
+
+    #[test]
+    fn test_restart_attempt_is_allowed_after_cooldown() {
+        let now = Instant::now();
+
+        assert!(restart_attempt_allowed(
+            Some(now),
+            now + Duration::from_secs(600),
+            Duration::from_secs(600)
+        ));
+        assert!(restart_attempt_allowed(None, now, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn test_temp_config_guard_removes_file_on_drop() {
+        let path = get_temp_check_path();
+        fs::write(&path, "temporary config").expect("temporary file should be writable");
+
+        {
+            let _guard = TempConfigGuard::new(path.clone());
+            assert!(path.exists());
+        }
+
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restrict_config_permissions_removes_group_and_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = get_temp_check_path();
+        fs::write(&path, "{}").expect("temporary config should be writable");
+        let mut permissions = fs::metadata(&path)
+            .expect("temporary config should have metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("test permissions should be writable");
+
+        restrict_config_permissions(path.to_str().expect("temporary path should be UTF-8"))
+            .expect("config permissions should be restricted");
+        let mode = fs::metadata(&path)
+            .expect("restricted config should have metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_update_vpn_outbound_interface_updates_named_direct_outbound() {
+        let mut config = serde_json::json!({
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "direct", "tag": "vpn-direct", "bind_interface": "utun5"},
+                {"type": "selector", "tag": "proxy"}
+            ]
+        });
+
+        let changed = update_vpn_outbound_interface(&mut config, "vpn-direct", "utun12")
+            .expect("vpn-direct should be updated");
+
+        assert!(changed);
+        assert_eq!(config["outbounds"][0].get("bind_interface"), None);
+        assert_eq!(
+            config["outbounds"][1]["bind_interface"],
+            Value::String("utun12".to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_vpn_outbound_interface_is_idempotent() {
+        let mut config = serde_json::json!({
+            "outbounds": [
+                {"type": "direct", "tag": "vpn-direct", "bind_interface": "utun5"}
+            ]
+        });
+
+        let changed = update_vpn_outbound_interface(&mut config, "vpn-direct", "utun5")
+            .expect("existing vpn-direct should be accepted");
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_update_vpn_outbound_interface_rejects_non_direct_outbound() {
+        let mut config = serde_json::json!({
+            "outbounds": [
+                {"type": "selector", "tag": "vpn-direct", "default": "proxy"}
+            ]
+        });
+
+        let err = update_vpn_outbound_interface(&mut config, "vpn-direct", "utun5")
+            .expect_err("only direct outbounds can be rebound");
+
+        assert!(err.contains("direct"));
     }
 }

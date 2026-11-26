@@ -90,18 +90,38 @@ except Exception as e:
     print("ERROR_READ: " + str(e))
     sys.exit(1)
 
+# 1. 设置 outbounds freedom 的 UseIPv4 强制 IPv4 避免 IPv6 连接超时
+for ob in data.get("outbounds", []):
+    if ob.get("tag") == "direct" and ob.get("protocol") == "freedom":
+        if ob.setdefault("settings", {}).get("domainStrategy") != "UseIPv4":
+            ob["settings"]["domainStrategy"] = "UseIPv4"
+            changed = True
+
+# 2. 设置 dns servers
+if data.get("dns", {}).get("servers") != ["8.8.8.8", "1.1.1.1"]:
+    data["dns"] = {"servers": ["8.8.8.8", "1.1.1.1"]}
+    changed = True
+
 rules = data.setdefault("routing", {}).setdefault("rules", [])
 google_play_domains = [
-    "domain:googleapis.cn",
+    "domain:play.googleapis.com",
+    "domain:play-lh.googleusercontent.com",
+    "domain:android.clients.google.com",
+    "domain:dl.google.com",
     "domain:services.googleapis.cn",
+    "domain:googleapis.cn",
     "domain:googleapis.com",
     "domain:gvt0.com",
     "domain:gvt1.com",
     "domain:gvt2.com",
     "domain:gvt3.com",
+    "domain:gvt4.com",
     "domain:gvt5.com",
+    "domain:gvt6.com",
+    "domain:gvt7.com",
     "domain:googleusercontent.com",
     "domain:googlezip.net",
+    "domain:ggpht.com",
     "domain:xn--ngstr-lra8j.com"
 ]
 target_domains = [
@@ -109,7 +129,6 @@ target_domains = [
     "domain:internal-api-lark-api.feishu.cn"
 ]
 
-changed = False
 google_allow = None
 for rule in rules:
     if rule.get("outboundTag") == "direct" and any(

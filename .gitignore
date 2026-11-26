@@ -6,6 +6,8 @@
 
 # Local private configuration and cache files
 bwg_servers.json
+zephyr_nodes.json
+zephyr_policy.json
 client_nodes.json
 client_pending_report.json
 direct_suffixes.txt

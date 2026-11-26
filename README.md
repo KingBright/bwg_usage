@@ -137,6 +137,20 @@ chmod +x /usr/local/bin/bwh_helper
   ```
   这个开关默认关闭，避免每次 helper 升级或重启都打断当前代理连接。
 
+  macOS 同时运行 sing-box TUN 和公司 VPN 时，可以让 helper 自动跟踪 VPN 的动态 `utun` 编号：
+  ```bash
+  SINGBOX_VPN_PROBE_IP=10.20.30.40 \
+  SINGBOX_VPN_OUTBOUND_TAG=vpn-direct \
+  SINGBOX_VPN_INTERFACE_PREFIXES=utun \
+  SINGBOX_VPN_MONITOR_SECS=15 \
+  SINGBOX_VPN_STABLE_CHECKS=3 \
+  SINGBOX_VPN_RESTART_COOLDOWN_SECS=600 \
+  bwh_helper daemon
+  ```
+  `SINGBOX_VPN_PROBE_IP` 应填写一个稳定的公司内网 IP，并确保它已被 TUN 的 `route_exclude_address` 排除。sing-box 配置中需要预先存在对应的 `direct` 出站（默认 tag 为 `vpn-direct`）和指向该出站的公司域名/IP 规则。若公司域名来自 `/etc/hosts`，还应为该出站设置 `"domain_resolver": "dns-hosts"`，其中 `dns-hosts` 是读取 `/etc/hosts` 的 `hosts` 类型 DNS server；否则 HTTP/SOCKS 代理收到域名目标时可能被默认公共 DNS 的 `NXDOMAIN` 负缓存影响。helper 每隔 15 秒使用固定参数执行 `/sbin/route -n get <IP>`；只有结果匹配允许的接口前缀且连续 3 次保持稳定时，才更新 `bind_interface`。完整配置校验通过后才覆盖并重启 sing-box，自动重启默认还有 10 分钟冷却期；VPN 未连接、目标回落到 `en0` 或接口未变化时不会改动配置。
+
+  Smart Mine 的 LAN、GitLab、iNode、生产入口和 YWB 特例见 [`SMART_MINE_ROUTING.md`](SMART_MINE_ROUTING.md)。
+
 ---
 
 ## 🌐 NAS 服务端部署与配置
